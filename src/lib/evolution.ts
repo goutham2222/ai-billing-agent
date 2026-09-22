@@ -27,15 +27,27 @@ export class EvolutionClient {
 
   /**
    * Fetches base64 binary buffer for an encrypted WhatsApp media message.
-   * This decrypts and dumps the binary before WhatsApp temporary CDN URLs expire.
+   * Evolution API v2 requires the full message object (including `key` and `message` contents)
+   * in the request body: `{ message: rawMessageObject, convertToMp4: false }`.
    */
   async getBase64FromMediaMessage(
     instance: string,
-    message: unknown
+    rawMessage: unknown
   ): Promise<Base64MediaResponse> {
     try {
+      // Normalize message payload to ensure `{ key, message }` structure is forwarded
+      const messagePayload =
+        typeof rawMessage === 'object' &&
+        rawMessage !== null &&
+        'message' in rawMessage &&
+        typeof (rawMessage as Record<string, unknown>).message === 'object' &&
+        (rawMessage as Record<string, unknown>).message !== null &&
+        'key' in ((rawMessage as Record<string, unknown>).message as Record<string, unknown>)
+          ? (rawMessage as Record<string, unknown>).message
+          : rawMessage;
+
       const response = await this.http.post(`/chat/getBase64FromMediaMessage/${instance}`, {
-        message,
+        message: messagePayload,
         convertToMp4: false,
       });
 

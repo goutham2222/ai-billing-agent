@@ -1,7 +1,7 @@
 import { supabase } from '../../lib/supabase.js';
 import { evolution } from '../../lib/evolution.js';
 import { env } from '../../config/env.js';
-import { EvolutionMessageContent } from '../../types/evolution.js';
+import { EvolutionWebhookData } from '../../types/evolution.js';
 
 export interface OffloadedMedia {
   storagePath: string;
@@ -45,12 +45,21 @@ function cleanMimeType(mimeType: string): string {
 /**
  * Offloads WhatsApp media directly from Evolution API to Supabase Storage
  * before temporary WhatsApp CDN media URLs expire.
+ *
+ * Forwards the full raw message node (`key`, `message`, `messageType`)
+ * required by Evolution API v2 to decrypt the media stream.
  */
 export async function offloadMediaToSupabase(
   instance: string,
-  messageContent: EvolutionMessageContent,
-  messageId: string
+  rawMessage: EvolutionWebhookData
 ): Promise<OffloadedMedia | null> {
+  const messageContent = rawMessage.message;
+  const messageId = rawMessage.key?.id || `msg-${Date.now()}`;
+
+  if (!messageContent) {
+    return null;
+  }
+
   let detectedType: 'image' | 'audio' | 'document' | null = null;
   let rawMime = 'application/octet-stream';
 
@@ -72,8 +81,8 @@ export async function offloadMediaToSupabase(
   const mimeType = cleanMimeType(rawMime);
   const extension = getExtension(mimeType);
 
-  // 1. Fetch decrypted base64 from Evolution API
-  const { base64 } = await evolution.getBase64FromMediaMessage(instance, messageContent);
+  // 1. Fetch decrypted base64 from Evolution API v2 using the full message node
+  const { base64 } = await evolution.getBase64FromMediaMessage(instance, rawMessage);
   const buffer = Buffer.from(base64, 'base64');
 
   // 2. Generate deterministic storage path in Supabase

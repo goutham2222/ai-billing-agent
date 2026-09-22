@@ -31,7 +31,7 @@ async function processInboundBillingMessage(
   ) {
     try {
       log.info({ messageId, instance }, '⏳ Initiating media offload to Supabase Storage...');
-      const media = await offloadMediaToSupabase(instance, messageContent, messageId);
+      const media = await offloadMediaToSupabase(instance, data);
 
       if (media) {
         log.info(
