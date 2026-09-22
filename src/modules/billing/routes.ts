@@ -20,11 +20,16 @@ import { handleCustomerReminder } from '../invoicing/reminders.js';
 
 /**
  * Resolves the most recent pending bill action for an owner given a confirmed choice.
+ * Validates that an action is currently awaiting confirmation.
+ * If the most recent action was already finalized (completed or cancelled), notifies
+ * the owner with a polite alert to prevent duplicate processing or accidental extraction.
  */
 async function resolvePendingBillAction(
   ownerPhone: string,
-  choice: 'paid' | 'pending' | 'reject'
+  choice: 'paid' | 'pending' | 'reject',
+  instance: string
 ): Promise<boolean> {
+  // 1. Look up pending action currently awaiting confirmation
   let { data: latestPending } = await supabase
     .from('pending_actions')
     .select('*')
@@ -57,6 +62,44 @@ async function resolvePendingBillAction(
     });
     return true;
   }
+
+  // 2. If no active pending action, check if the latest action was already finalized
+  let { data: latestAny } = await supabase
+    .from('pending_actions')
+    .select('*')
+    .eq('owner_phone', ownerPhone)
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (!latestAny) {
+    const last10 = ownerPhone.slice(-10);
+    if (last10.length === 10) {
+      const { data: fallbackAny } = await supabase
+        .from('pending_actions')
+        .select('*')
+        .ilike('owner_phone', `%${last10}`)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      latestAny = fallbackAny;
+    }
+  }
+
+  if (latestAny && (latestAny.status === 'completed' || latestAny.status === 'cancelled')) {
+    try {
+      await evolution.sendTextMessage(
+        instance,
+        ownerPhone,
+        '⚠️ This bill has already been confirmed and finalized.'
+      );
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn(`[State Engine] Failed to dispatch already-finalized notice to ${ownerPhone}: ${msg}`);
+    }
+    return true;
+  }
+
   return false;
 }
 
@@ -75,43 +118,15 @@ async function processInboundBillingMessage(
 
   log.info({ event, instance, messageId, sender }, '🔄 Processing billing webhook payload in background');
 
-  const senderPhone = sender ? sender.replace(/[^0-9]/g, '') : (env.STORE_OWNER_PHONE || '');
-  const ownerPhone = env.STORE_OWNER_PHONE || senderPhone;
-
-  // 1a. Check for native WhatsApp Poll votes (pollUpdateMessage)
-  const rawPollUpdates = (data as any)?.pollUpdates;
-  if (
-    data?.messageType === 'pollUpdateMessage' ||
-    (Array.isArray(rawPollUpdates) && rawPollUpdates.length > 0)
-  ) {
-    const votedOption = Array.isArray(rawPollUpdates)
-      ? rawPollUpdates.find((opt: any) => Array.isArray(opt.voters) && opt.voters.length > 0)
-      : null;
-
-    if (votedOption && typeof votedOption.name === 'string') {
-      const optName = votedOption.name.toLowerCase();
-      const isPaid = optName.includes('paid') || optName.startsWith('1');
-      const isPending = optName.includes('udhaar') || optName.includes('pending') || optName.startsWith('2');
-      const isCancel = optName.includes('reject') || optName.includes('cancel') || optName.startsWith('3');
-
-      if (isPaid || isPending || isCancel) {
-        const choice = isPaid ? 'paid' : isPending ? 'pending' : 'reject';
-        log.info(
-          { messageId, choice, votedOption: votedOption.name, ownerPhone },
-          '🔘 Resolving pending bill action via native WhatsApp poll update'
-        );
-        const resolved = await resolvePendingBillAction(ownerPhone, choice);
-        if (resolved) return;
-      }
-    }
-  }
-
   if (!messageContent) {
     log.debug({ messageId }, 'No message content found, skipping');
     return;
   }
 
-  // 1b. Check for interactive WhatsApp list or button reply events
+  const senderPhone = sender ? sender.replace(/[^0-9]/g, '') : (env.STORE_OWNER_PHONE || '');
+  const ownerPhone = env.STORE_OWNER_PHONE || senderPhone;
+
+  // 1. Check for interactive WhatsApp list or button reply events
   const msgAny = messageContent as Record<string, any>;
   const selectedActionId =
     // List response (singleSelectReply)
@@ -228,6 +243,11 @@ async function processInboundBillingMessage(
       cleanText === '1' ||
       cleanText === '1paid' ||
       lowerText === 'paid' ||
+      cleanText === 'paid' ||
+      lowerText === 'settled' ||
+      cleanText === 'settled' ||
+      lowerText === 'jama' ||
+      cleanText === 'jama' ||
       lowerText.startsWith('1 ') ||
       lowerText === 'confirm paid';
 
@@ -236,18 +256,28 @@ async function processInboundBillingMessage(
       cleanText === '2' ||
       cleanText === '2udhaar' ||
       lowerText === 'udhaar' ||
+      cleanText === 'udhaar' ||
       lowerText === 'pending' ||
+      cleanText === 'pending' ||
+      lowerText === 'baki' ||
+      lowerText === 'baaki' ||
+      cleanText === 'baki' ||
+      cleanText === 'baaki' ||
       lowerText.startsWith('2 ') ||
-      lowerText === 'baki';
+      lowerText === 'confirm udhaar';
 
     const isCancel =
       lowerText === '3' ||
       cleanText === '3' ||
       cleanText === '3cancel' ||
       lowerText === 'cancel' ||
-      lowerText.startsWith('3 ') ||
+      cleanText === 'cancel' ||
       lowerText === 'reject' ||
-      lowerText === 'discard';
+      cleanText === 'reject' ||
+      lowerText === 'discard' ||
+      cleanText === 'discard' ||
+      lowerText.startsWith('3 ') ||
+      lowerText === 'cancel draft';
 
     if (isPaid || isPending || isCancel) {
       const choice = isPaid ? 'paid' : isPending ? 'pending' : 'reject';
@@ -257,7 +287,7 @@ async function processInboundBillingMessage(
         '🔘 Resolving pending bill action via text shorthand'
       );
 
-      const resolved = await resolvePendingBillAction(ownerPhone, choice);
+      const resolved = await resolvePendingBillAction(ownerPhone, choice, instance);
       if (resolved) return;
     }
 

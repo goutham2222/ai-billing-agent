@@ -256,29 +256,24 @@ export async function sendConfirmationList(params: {
     .filter((line) => line !== '')
     .join('\n');
 
-  // 3. Structured text card with direct reply instructions
-  const cardText = `${title}\n\n${description}\n\n👉 *Reply with 1 (Paid), 2 (Udhaar), or 3 (Cancel)*`;
+  // 3. Send clean, well-formatted WhatsApp text summary card with explicit reply instructions
+  const cardText = [
+    `*${title}*`,
+    '',
+    description,
+    '',
+    '👉 *Reply with:*',
+    '• *1* (or *paid* / *settled* / *jama*) ➔ Confirm Paid',
+    '• *2* (or *udhaar* / *pending* / *baki*) ➔ Confirm Udhaar',
+    '• *3* (or *cancel* / *reject* / *discard*) ➔ Discard Draft',
+  ].join('\n');
+
   await safeSendTextMessage(ownerPhone, cardText);
-
-  // 4. Also dispatch a native interactive WhatsApp Poll for one-tap confirmation
-  try {
-    const pollTitle = `Confirm Bill${billNumberText}: ${customerName} (₹${extractedBill.totalAmount})`;
-    await evolution.sendPoll(
-      env.BILLING_INSTANCE_NAME,
-      ownerPhone,
-      pollTitle,
-      ['1. Confirm Paid', '2. Confirm Udhaar', '3. Reject / Cancel'],
-      1
-    );
-  } catch (pollErr: unknown) {
-    const msg = pollErr instanceof Error ? pollErr.message : String(pollErr);
-    console.debug(`[Evolution Poll] Native poll dispatch skipped or unconfirmed: ${msg}`);
-  }
-
   return { success: true };
 }
 
-// Retain alias for backward compatibility
+// Aliases for backward compatibility and clean semantics
+export const sendConfirmationPrompt = sendConfirmationList;
 export const sendConfirmationButtons = sendConfirmationList;
 
 /**
@@ -444,7 +439,7 @@ export async function handleButtonConfirmation(params: {
   }
 
   if (action.status === 'completed' || action.status === 'cancelled') {
-    const alertMsg = `ℹ️ This bill has already been marked as *${action.status.toUpperCase()}*.`;
+    const alertMsg = '⚠️ This bill has already been confirmed and finalized.';
     await safeSendTextMessage(senderPhone, alertMsg);
     return { success: false, message: alertMsg };
   }
