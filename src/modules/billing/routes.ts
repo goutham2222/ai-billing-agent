@@ -86,18 +86,34 @@ async function resolvePendingBillAction(
     }
   }
 
-  if (latestAny && (latestAny.status === 'completed' || latestAny.status === 'cancelled')) {
-    try {
-      await evolution.sendTextMessage(
-        instance,
-        ownerPhone,
-        '⚠️ This bill has already been confirmed and finalized.'
-      );
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      console.warn(`[State Engine] Failed to dispatch already-finalized notice to ${ownerPhone}: ${msg}`);
+  if (latestAny) {
+    if (latestAny.status === 'completed' || latestAny.status === 'cancelled') {
+      try {
+        await evolution.sendTextMessage(
+          instance,
+          ownerPhone,
+          '⚠️ This bill has already been confirmed and finalized.'
+        );
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn(`[State Engine] Failed to dispatch already-finalized notice to ${ownerPhone}: ${msg}`);
+      }
+      return true;
     }
-    return true;
+
+    if (latestAny.status === 'superseded') {
+      try {
+        await evolution.sendTextMessage(
+          instance,
+          ownerPhone,
+          '⚠️ This bill draft has been superseded by a newer bill.'
+        );
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn(`[State Engine] Failed to dispatch superseded notice to ${ownerPhone}: ${msg}`);
+      }
+      return true;
+    }
   }
 
   return false;
@@ -202,7 +218,7 @@ async function processInboundBillingMessage(
 
         // Stage 3: Persist draft bill & pending_action in Supabase
         log.info({ messageId, ownerPhone }, '💾 Persisting customer, draft bill, and pending action...');
-        const { bill, pendingAction } = await createDraftAndPendingAction({
+        const { bill, pendingAction, customer } = await createDraftAndPendingAction({
           extractedBill,
           mediaUrl: media.storageUrl,
           rawMessageId: messageId,
@@ -217,6 +233,7 @@ async function processInboundBillingMessage(
             bill,
             pendingActionId: pendingAction.whatsapp_message_id,
             extractedBill,
+            customerInfo: customer,
           });
           log.info({ messageId, ownerPhone }, '✅ Confirmation list successfully dispatched');
         }
@@ -380,7 +397,7 @@ async function processInboundBillingMessage(
 
       // Stage 3: Persist draft bill & pending_action in Supabase
       log.info({ messageId, ownerPhone }, '💾 Persisting customer, draft bill, and pending action...');
-      const { bill, pendingAction } = await createDraftAndPendingAction({
+      const { bill, pendingAction, customer } = await createDraftAndPendingAction({
         extractedBill,
         rawMessageId: messageId,
         ownerPhone,
@@ -394,6 +411,7 @@ async function processInboundBillingMessage(
           bill,
           pendingActionId: pendingAction.whatsapp_message_id,
           extractedBill,
+          customerInfo: customer,
         });
         log.info({ messageId, ownerPhone }, '✅ Confirmation list successfully dispatched');
       }

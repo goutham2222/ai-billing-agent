@@ -10,6 +10,8 @@ export interface DraftAndPendingResult {
     id: string;
     name: string;
     phone: string;
+    tier: 'existing' | 'new' | 'walkin';
+    outstandingDebt: number;
   };
   bill: {
     id: string;
@@ -33,6 +35,8 @@ export interface StoredBillData {
   customer_id: string;
   customer_name: string;
   customer_phone: string;
+  customer_tier?: 'existing' | 'new' | 'walkin';
+  outstanding_debt?: number;
   total_amount: number;
   items: unknown;
   payment_status: 'paid' | 'pending';
@@ -40,6 +44,13 @@ export interface StoredBillData {
   raw_message_id: string;
   raw_transcription?: string;
   expires_at: string;
+}
+
+export interface CustomerCardInfo {
+  name: string;
+  phone?: string;
+  tier?: 'existing' | 'new' | 'walkin';
+  outstandingDebt?: number;
 }
 
 /**
@@ -81,73 +92,163 @@ export async function createDraftAndPendingAction(params: {
 }): Promise<DraftAndPendingResult> {
   const { extractedBill, mediaUrl, rawMessageId, ownerPhone } = params;
 
-  // 1. Customer Lookup / Upsert
-  let customer: { id: string; name: string; phone: string } | null = null;
-  const rawCustomerName = extractedBill.customer.name?.trim() || 'Walk-in Customer';
-  const rawPhone = extractedBill.customer.phone?.replace(/[^0-9]/g, '');
+  // 1. Determine Customer Tier and Identifiers
+  const rawCustomerName = extractedBill.customer.name?.trim() || '';
+  const isAnonymousName =
+    !rawCustomerName ||
+    rawCustomerName.toLowerCase() === 'walk-in customer' ||
+    rawCustomerName.toLowerCase() === 'walk in customer' ||
+    rawCustomerName.toLowerCase() === 'walk-in' ||
+    rawCustomerName.toLowerCase() === 'walkin' ||
+    rawCustomerName.toLowerCase() === 'anonymous' ||
+    rawCustomerName.toLowerCase() === 'customer';
+
+  const rawPhone = extractedBill.customer.phone?.replace(/[^0-9]/g, '') || '';
   const normalizedPhone = normalizePhoneNumber(extractedBill.customer.phone);
+  const hasValidPhone = normalizedPhone.length >= 7 || rawPhone.length >= 7;
+  const hasNamedIdentifier = !isAnonymousName;
+  const hasIdentifier = hasNamedIdentifier || hasValidPhone;
 
-  // 1a. Try lookup by phone if phone was provided
-  if (normalizedPhone && normalizedPhone.length >= 7) {
-    const filterQuery = rawPhone && rawPhone !== normalizedPhone
-      ? `phone.eq.${normalizedPhone},phone.eq.${rawPhone}`
-      : `phone.eq.${normalizedPhone}`;
+  let customer: {
+    id: string;
+    name: string;
+    phone: string;
+    tier: 'existing' | 'new' | 'walkin';
+    outstandingDebt: number;
+  };
 
-    const { data: byPhone, error: phoneErr } = await supabase
+  if (!hasIdentifier) {
+    // Tier 3: Walk-in Customer (Anonymous - zero identifiers provided)
+    let walkinCust: { id: string; name: string; phone: string } | null = null;
+    const { data: existingWalkin } = await supabase
       .from('customers')
       .select('id, name, phone')
-      .or(filterQuery)
+      .eq('name', 'Walk-in Customer')
       .limit(1)
       .maybeSingle();
 
-    if (!phoneErr && byPhone) {
-      customer = byPhone;
-    }
-  }
+    if (existingWalkin) {
+      walkinCust = existingWalkin;
+    } else {
+      const fallbackPhone = `walkin-${Date.now().toString().slice(-6)}-${Math.floor(100 + Math.random() * 900)}`;
+      const { data: newWalkin, error: insertWalkinErr } = await supabase
+        .from('customers')
+        .insert({
+          name: 'Walk-in Customer',
+          phone: fallbackPhone,
+          preferred_language: 'en',
+        })
+        .select('id, name, phone')
+        .single();
 
-  // 1b. If not found by phone, try lookup by name (case-insensitive)
-  if (!customer && rawCustomerName.toLowerCase() !== 'walk-in customer') {
-    const { data: byName, error: nameErr } = await supabase
-      .from('customers')
-      .select('id, name, phone')
-      .ilike('name', rawCustomerName)
-      .limit(1)
-      .maybeSingle();
-
-    if (!nameErr && byName) {
-      customer = byName;
-    }
-  }
-
-  // 1c. If still not found, insert new customer row
-  if (!customer) {
-    const preferredLang =
-      extractedBill.detectedLanguage === 'te'
-        ? 'Telugu'
-        : extractedBill.detectedLanguage === 'hi'
-        ? 'Hindi'
-        : 'English';
-
-    // Satisfy not-null and unique constraint on phone with normalized phone number
-    const fallbackPhone = normalizedPhone && normalizedPhone.length >= 7
-      ? normalizedPhone
-      : `walkin-${Date.now().toString().slice(-6)}-${Math.floor(100 + Math.random() * 900)}`;
-
-    const { data: newCustomer, error: insertCustErr } = await supabase
-      .from('customers')
-      .insert({
-        name: rawCustomerName,
-        phone: fallbackPhone,
-        preferred_language: preferredLang,
-      })
-      .select('id, name, phone')
-      .single();
-
-    if (insertCustErr || !newCustomer) {
-      throw new Error(`Failed to create customer: ${insertCustErr?.message || 'Unknown error'}`);
+      if (insertWalkinErr || !newWalkin) {
+        throw new Error(`Failed to create walk-in customer: ${insertWalkinErr?.message || 'Unknown error'}`);
+      }
+      walkinCust = newWalkin;
     }
 
-    customer = newCustomer;
+    customer = {
+      id: walkinCust.id,
+      name: 'Walk-in Customer',
+      phone: walkinCust.phone,
+      tier: 'walkin',
+      outstandingDebt: 0,
+    };
+  } else {
+    // Has identifier: Search for existing customer (Tier 1)
+    let existingCust: { id: string; name: string; phone: string } | null = null;
+
+    // 1a. Try lookup by phone if phone was provided
+    if (hasValidPhone) {
+      const last10 = normalizedPhone.slice(-10);
+      let phoneQuery = supabase.from('customers').select('id, name, phone');
+
+      if (last10.length === 10) {
+        phoneQuery = phoneQuery.or(`phone.eq.${normalizedPhone},phone.ilike.%${last10}`);
+      } else {
+        phoneQuery = phoneQuery.eq('phone', normalizedPhone);
+      }
+
+      const { data: byPhone, error: phoneErr } = await phoneQuery.limit(1).maybeSingle();
+      if (!phoneErr && byPhone) {
+        existingCust = byPhone;
+      }
+    }
+
+    // 1b. Try lookup by name (case-insensitive ILIKE) if not found by phone and name provided
+    if (!existingCust && hasNamedIdentifier) {
+      const { data: byName, error: nameErr } = await supabase
+        .from('customers')
+        .select('id, name, phone')
+        .ilike('name', rawCustomerName)
+        .limit(1)
+        .maybeSingle();
+
+      if (!nameErr && byName) {
+        existingCust = byName;
+      }
+    }
+
+    if (existingCust) {
+      // Tier 1: Existing Customer
+      // Fetch current total_debt from unpaid bills (payment_status = 'pending')
+      const { data: unpaidBills } = await supabase
+        .from('bills')
+        .select('total_amount')
+        .eq('customer_id', existingCust.id)
+        .eq('payment_status', 'pending');
+
+      const totalDebt = (unpaidBills || []).reduce(
+        (sum, b) => sum + (Number(b.total_amount) || 0),
+        0
+      );
+
+      customer = {
+        id: existingCust.id,
+        name: existingCust.name,
+        phone: existingCust.phone,
+        tier: 'existing',
+        outstandingDebt: totalDebt,
+      };
+    } else {
+      // Tier 2: New Customer Onboarded (Identifier provided but not in DB)
+      const preferredLang =
+        extractedBill.detectedLanguage === 'te'
+          ? 'Telugu'
+          : extractedBill.detectedLanguage === 'hi'
+          ? 'Hindi'
+          : 'English';
+
+      const customerName = hasNamedIdentifier
+        ? rawCustomerName
+        : `Customer ${rawPhone.slice(-4) || 'New'}`;
+
+      const customerPhone = normalizedPhone && normalizedPhone.length >= 7
+        ? normalizedPhone
+        : `newcust-${Date.now().toString().slice(-6)}-${Math.floor(100 + Math.random() * 900)}`;
+
+      const { data: newCustomer, error: insertCustErr } = await supabase
+        .from('customers')
+        .insert({
+          name: customerName,
+          phone: customerPhone,
+          preferred_language: preferredLang,
+        })
+        .select('id, name, phone')
+        .single();
+
+      if (insertCustErr || !newCustomer) {
+        throw new Error(`Failed to create new customer: ${insertCustErr?.message || 'Unknown error'}`);
+      }
+
+      customer = {
+        id: newCustomer.id,
+        name: newCustomer.name,
+        phone: newCustomer.phone,
+        tier: 'new',
+        outstandingDebt: 0,
+      };
+    }
   }
 
   // 2. Insert draft bill into bills table
@@ -167,7 +268,24 @@ export async function createDraftAndPendingAction(params: {
     throw new Error(`Failed to create draft bill: ${billErr?.message || 'Unknown error'}`);
   }
 
-  // 3. Create Pending Action in pending_actions table
+  // 3. Stale Action Guardrail: Enforce strictly <= 1 active pending action per owner
+  // Automatically mark any older unconfirmed awaiting_confirmation actions as 'superseded'
+  const last10Owner = ownerPhone ? ownerPhone.slice(-10) : '';
+  if (last10Owner.length === 10) {
+    await supabase
+      .from('pending_actions')
+      .update({ status: 'superseded' })
+      .eq('status', 'awaiting_confirmation')
+      .ilike('owner_phone', `%${last10Owner}`);
+  } else if (ownerPhone) {
+    await supabase
+      .from('pending_actions')
+      .update({ status: 'superseded' })
+      .eq('status', 'awaiting_confirmation')
+      .eq('owner_phone', ownerPhone);
+  }
+
+  // 4. Create Pending Action in pending_actions table
   const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
   const billData: StoredBillData = {
     bill_id: newBill.id,
@@ -175,6 +293,8 @@ export async function createDraftAndPendingAction(params: {
     customer_id: customer.id,
     customer_name: customer.name,
     customer_phone: customer.phone,
+    customer_tier: customer.tier,
+    outstanding_debt: customer.outstandingDebt,
     total_amount: Number(newBill.total_amount),
     items: extractedBill.items,
     payment_status: extractedBill.paymentStatus,
@@ -215,9 +335,22 @@ export async function sendConfirmationList(params: {
   bill: { id: string; bill_no?: number; total_amount: number };
   pendingActionId: string;
   extractedBill: ExtractedBill;
+  customerInfo?: CustomerCardInfo;
 }): Promise<unknown> {
-  const { ownerPhone, bill, pendingActionId: _pendingActionId, extractedBill } = params;
-  const customerName = extractedBill.customer.name?.trim() || 'Customer';
+  const { ownerPhone, bill, pendingActionId: _pendingActionId, extractedBill, customerInfo } = params;
+  const customerName = customerInfo?.name || extractedBill.customer.name?.trim() || 'Walk-in Customer';
+  const tier = customerInfo?.tier || (extractedBill.customer.name && extractedBill.customer.name.toLowerCase() !== 'walk-in customer' ? 'existing' : 'walkin');
+  const outstandingDebt = customerInfo?.outstandingDebt ?? 0;
+
+  // Format customer display line matching 3-tier rules
+  let customerLine = `👤 *Customer:* ${customerName}`;
+  if (tier === 'existing') {
+    customerLine = `👤 *Customer:* ${customerName} (Existing — Outstanding Udhaar: Rs. ${outstandingDebt})`;
+  } else if (tier === 'new') {
+    customerLine = `👤 *Customer:* ${customerName} [New Customer Onboarded]`;
+  } else if (tier === 'walkin') {
+    customerLine = `👤 *Customer:* Walk-in Customer (Anonymous)`;
+  }
 
   // Build items formatted list
   const itemsText = extractedBill.items.length > 0
@@ -242,11 +375,12 @@ export async function sendConfirmationList(params: {
 
   const billNumberText = bill.bill_no ? ` #${bill.bill_no}` : '';
 
-  // 1. Title: "📝 Confirm Bill for {customerName}"
+  // 1. Title
   const title = `📝 Confirm Bill for ${customerName}${billNumberText}`;
 
-  // 2. Description: Formatted summary (items list, total amount, detected status)
+  // 2. Description: Formatted summary card with 3-tier customer info
   const description = [
+    customerLine,
     `🛒 *Items:*`,
     itemsText,
     amountWarning,
@@ -302,6 +436,12 @@ async function generateAndSendInvoice(params: {
     ownerPhone,
   } = params;
 
+  // Zero-amount guardrail: Never generate or dispatch PDF invoices if total_amount <= 0
+  if (totalAmount <= 0) {
+    console.info(`[Invoice Engine] Skipping invoice generation: totalAmount is ${totalAmount}`);
+    return;
+  }
+
   try {
     const rawItems = Array.isArray(items) ? (items as InvoiceItem[]) : [];
 
@@ -329,72 +469,68 @@ async function generateAndSendInvoice(params: {
     const cleanBillNo = billNo ? `#${billNo}` : '';
     const pdfBase64 = pdfBuffer.toString('base64');
 
-    // 3. Send PDF document to Store Owner using fast base64 payload
-    if (ownerPhone) {
+    // 3. Separate Owner vs Customer Dispatch Determination
+    const cleanCustomerPhone = normalizePhoneNumber(customerPhone);
+    const cleanOwnerPhone = normalizePhoneNumber(ownerPhone || env.STORE_OWNER_PHONE);
+
+    const isCustomerPhoneMissingOrWalkin =
+      !cleanCustomerPhone ||
+      cleanCustomerPhone.length < 10 ||
+      customerPhone?.startsWith('walkin-') ||
+      customerPhone?.startsWith('newcust-');
+
+    const isSelfTesting =
+      !isCustomerPhoneMissingOrWalkin &&
+      Boolean(
+        cleanCustomerPhone === cleanOwnerPhone ||
+        (cleanOwnerPhone.length >= 10 && cleanCustomerPhone.endsWith(cleanOwnerPhone.slice(-10))) ||
+        (cleanCustomerPhone.length >= 10 && cleanOwnerPhone.endsWith(cleanCustomerPhone.slice(-10)))
+      );
+
+    const hasSeparateCustomerPhone = !isCustomerPhoneMissingOrWalkin && !isSelfTesting;
+
+    // Helper for reliable WhatsApp media dispatch with base64 and URL fallback
+    const sendPdfDocument = async (targetPhone: string, captionText: string) => {
       try {
         await evolution.sendMedia(env.BILLING_INSTANCE_NAME, {
-          number: ownerPhone,
+          number: targetPhone,
           mediatype: 'document',
           mimetype: 'application/pdf',
           media: pdfBase64,
           fileName: `Invoice_${billNo || 'bill'}.pdf`,
-          caption: `🧾 *Invoice ${cleanBillNo} - ${customerName}*\n💰 Total: Rs. ${totalAmount}\n📌 Status: ${statusBadge}`,
+          caption: captionText,
         });
-      } catch (ownerSendErr: unknown) {
-        // Fallback to public storage URL if base64 fails
+      } catch (sendErr: unknown) {
         try {
           await evolution.sendMedia(env.BILLING_INSTANCE_NAME, {
-            number: ownerPhone,
+            number: targetPhone,
             mediatype: 'document',
             mimetype: 'application/pdf',
             media: invoiceUrl,
             fileName: `Invoice_${billNo || 'bill'}.pdf`,
-            caption: `🧾 *Invoice ${cleanBillNo} - ${customerName}*\n💰 Total: Rs. ${totalAmount}\n📌 Status: ${statusBadge}`,
+            caption: captionText,
           });
         } catch (fallbackErr: unknown) {
           const msg = fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr);
-          console.warn(`[Invoice Dispatch] Failed to send PDF to owner: ${msg}`);
+          console.warn(`[Invoice Dispatch] Failed to send PDF to ${targetPhone}: ${msg}`);
         }
       }
-    }
+    };
 
-    // 4. Send PDF copy to Customer (with normalized country-coded phone)
-    const cleanCustomerPhone = normalizePhoneNumber(customerPhone);
-    const hasValidCustomerPhone =
-      cleanCustomerPhone &&
-      cleanCustomerPhone.length >= 10 &&
-      !customerPhone?.startsWith('walkin-');
-
-    if (hasValidCustomerPhone) {
+    if (hasSeparateCustomerPhone) {
+      // Dispatch PDF ONLY to Customer with personalized greeting
       const customerGreeting =
         paymentStatus === 'paid'
           ? `🧾 *Tax Invoice / Receipt ${cleanBillNo}*\nDear ${customerName}, here is your receipt for Rs. ${totalAmount}. Payment received with thanks!`
           : `🧾 *Invoice ${cleanBillNo}*\nDear ${customerName}, here is your invoice for Rs. ${totalAmount} recorded as Pending Udhaar. Thank you!`;
 
-      try {
-        await evolution.sendMedia(env.BILLING_INSTANCE_NAME, {
-          number: cleanCustomerPhone,
-          mediatype: 'document',
-          mimetype: 'application/pdf',
-          media: pdfBase64,
-          fileName: `Invoice_${billNo || 'bill'}.pdf`,
-          caption: customerGreeting,
-        });
-      } catch (custSendErr: unknown) {
-        // Fallback to public storage URL
-        try {
-          await evolution.sendMedia(env.BILLING_INSTANCE_NAME, {
-            number: cleanCustomerPhone,
-            mediatype: 'document',
-            mimetype: 'application/pdf',
-            media: invoiceUrl,
-            fileName: `Invoice_${billNo || 'bill'}.pdf`,
-            caption: customerGreeting,
-          });
-        } catch (fallbackCustErr: unknown) {
-          const msg = fallbackCustErr instanceof Error ? fallbackCustErr.message : String(fallbackCustErr);
-          console.warn(`[Invoice Dispatch] Failed to send PDF to customer (${customerPhone}): ${msg}`);
-        }
+      await sendPdfDocument(cleanCustomerPhone, customerGreeting);
+    } else {
+      // Self-testing scenario or customer phone missing: Send PDF to Store Owner so generated artifact is visible
+      const targetOwner = cleanOwnerPhone || ownerPhone;
+      if (targetOwner) {
+        const ownerCaption = `🧾 *Invoice ${cleanBillNo} - ${customerName}*\n💰 Total: Rs. ${totalAmount}\n📌 Status: ${statusBadge}`;
+        await sendPdfDocument(targetOwner, ownerCaption);
       }
     }
   } catch (err: unknown) {
@@ -444,15 +580,60 @@ export async function handleButtonConfirmation(params: {
     return { success: false, message: alertMsg };
   }
 
+  if (action.status === 'superseded') {
+    const alertMsg = '⚠️ This bill draft has been superseded by a newer bill.';
+    await safeSendTextMessage(senderPhone, alertMsg);
+    return { success: false, message: alertMsg };
+  }
+
   const billData = (action.bill_data as StoredBillData) || {};
   const billId = billData.bill_id;
   const billNo = billData.bill_no ? `#${billData.bill_no}` : '';
   const customerName = billData.customer_name || 'Customer';
   const totalAmount = billData.total_amount ?? 0;
 
+  // Walk-in Udhaar Block Guardrail: Disallow confirming Walk-in drafts as Udhaar
+  if (actionChoice === 'pending') {
+    const isWalkin =
+      billData.customer_tier === 'walkin' ||
+      customerName.toLowerCase() === 'walk-in customer' ||
+      customerName.toLowerCase() === 'walk in customer' ||
+      customerName.toLowerCase() === 'walk-in' ||
+      customerName.toLowerCase() === 'walkin' ||
+      customerName.toLowerCase() === 'anonymous' ||
+      billData.customer_phone?.startsWith('walkin-');
+
+    if (isWalkin) {
+      const blockMsg =
+        '⚠️ Cannot assign Udhaar to an anonymous Walk-in Customer. Please provide customer name or phone.';
+      await safeSendTextMessage(senderPhone, blockMsg);
+      return { success: false, message: blockMsg };
+    }
+  }
+
+  // Determine delivery recipient context
+  const cleanCustomerPhone = normalizePhoneNumber(billData.customer_phone);
+  const cleanOwnerPhone = normalizePhoneNumber(senderPhone || env.STORE_OWNER_PHONE);
+
+  const isCustomerPhoneMissingOrWalkin =
+    !cleanCustomerPhone ||
+    cleanCustomerPhone.length < 10 ||
+    billData.customer_phone?.startsWith('walkin-') ||
+    billData.customer_phone?.startsWith('newcust-');
+
+  const isSelfTesting =
+    !isCustomerPhoneMissingOrWalkin &&
+    Boolean(
+      cleanCustomerPhone === cleanOwnerPhone ||
+      (cleanOwnerPhone.length >= 10 && cleanCustomerPhone.endsWith(cleanOwnerPhone.slice(-10))) ||
+      (cleanCustomerPhone.length >= 10 && cleanOwnerPhone.endsWith(cleanCustomerPhone.slice(-10)))
+    );
+
+  const willDeliverToCustomer = !isCustomerPhoneMissingOrWalkin && !isSelfTesting && totalAmount > 0;
+  const willDeliverToOwner = (isSelfTesting || isCustomerPhoneMissingOrWalkin) && totalAmount > 0;
+
   // 2. Perform state transitions
   if (actionChoice === 'paid') {
-    // Mark bill as paid
     if (billId) {
       await supabase
         .from('bills')
@@ -465,11 +646,19 @@ export async function handleButtonConfirmation(params: {
       .update({ status: 'completed' })
       .eq('whatsapp_message_id', pendingActionId);
 
-    const confirmationText = `✅ *Bill ${billNo} Confirmed: PAID*\n👤 Customer: *${customerName}*\n💰 Amount: *₹${totalAmount}*\nPayment recorded as cleared.`;
+    let confirmationText = `✅ Bill ${billNo} for ${customerName} confirmed as PAID (Rs. ${totalAmount}).`;
+    if (totalAmount <= 0) {
+      confirmationText = `✅ Bill ${billNo} for ${customerName} confirmed as PAID (Rs. ${totalAmount}). (No invoice generated for ₹0 amount).`;
+    } else if (willDeliverToCustomer) {
+      confirmationText = `✅ Bill ${billNo} for ${customerName} confirmed as PAID (Rs. ${totalAmount}). PDF invoice delivered to customer.`;
+    } else if (willDeliverToOwner) {
+      confirmationText = `✅ Bill ${billNo} for ${customerName} confirmed as PAID (Rs. ${totalAmount}). PDF invoice generated below.`;
+    }
+
     await safeSendTextMessage(senderPhone, confirmationText);
 
-    // Stage 5 Hook: Trigger PDF generation & WhatsApp dispatch
-    if (billId) {
+    // Stage 5 Hook: Trigger PDF generation & WhatsApp dispatch if totalAmount > 0
+    if (billId && totalAmount > 0) {
       setImmediate(() => {
         generateAndSendInvoice({
           billId,
@@ -488,7 +677,6 @@ export async function handleButtonConfirmation(params: {
   }
 
   if (actionChoice === 'pending') {
-    // Mark bill as pending (Udhaar)
     if (billId) {
       await supabase
         .from('bills')
@@ -501,11 +689,19 @@ export async function handleButtonConfirmation(params: {
       .update({ status: 'completed' })
       .eq('whatsapp_message_id', pendingActionId);
 
-    const confirmationText = `⏳ *Bill ${billNo} Confirmed: UDHAAR (Pending)*\n👤 Customer: *${customerName}*\n💰 Amount: *₹${totalAmount}*\nRecorded into customer ledger as pending debt.`;
+    let confirmationText = `⏳ Bill ${billNo} for ${customerName} confirmed as UDHAAR (Rs. ${totalAmount}).`;
+    if (totalAmount <= 0) {
+      confirmationText = `⏳ Bill ${billNo} for ${customerName} confirmed as UDHAAR (Rs. ${totalAmount}). (No invoice generated for ₹0 amount).`;
+    } else if (willDeliverToCustomer) {
+      confirmationText = `⏳ Bill ${billNo} for ${customerName} confirmed as UDHAAR (Rs. ${totalAmount}). PDF invoice delivered to customer.`;
+    } else if (willDeliverToOwner) {
+      confirmationText = `⏳ Bill ${billNo} for ${customerName} confirmed as UDHAAR (Rs. ${totalAmount}). PDF invoice generated below.`;
+    }
+
     await safeSendTextMessage(senderPhone, confirmationText);
 
-    // Stage 5 Hook: Trigger PDF generation & WhatsApp dispatch
-    if (billId) {
+    // Stage 5 Hook: Trigger PDF generation & WhatsApp dispatch if totalAmount > 0
+    if (billId && totalAmount > 0) {
       setImmediate(() => {
         generateAndSendInvoice({
           billId,
@@ -524,7 +720,6 @@ export async function handleButtonConfirmation(params: {
   }
 
   if (actionChoice === 'reject') {
-    // Reject / Cancel draft bill
     if (billId) {
       await supabase
         .from('bills')
