@@ -26,6 +26,7 @@ const envSchema = z.object({
 
   // Gemini API
   GEMINI_API_KEY: z.string().min(1, { message: 'GEMINI_API_KEY is required' }),
+  GEMINI_MODEL: z.string().default('gemini-3.8-flash'),
 
   // Read-only database connection for Manager Text-to-SQL (Stage 4)
   READONLY_DATABASE_URL: z.string().optional(),

@@ -6,3 +6,24 @@
 - Binary Handling: WhatsApp media URLs expire quickly. Download media streams and push to Supabase Storage immediately before passing public/signed URLs to Gemini.
 - Security: Never expose `SUPABASE_SERVICE_ROLE_KEY` to public clients. The Manager Bot Text-to-SQL logic must connect via a strictly read-only PostgreSQL role.
 - Multilingual Normalization: Support English, Hindi, and Telugu. Map terms like "baki", "udhaar", or "pending" explicitly to `payment_status: 'pending'`.
+
+## Error Resolution Logging Protocol
+
+- Whenever you encounter an error (compilation, runtime, API failure, logic bug, or dependency mismatch) and subsequently resolve it successfully:
+  - Immediately log the resolution into a dedicated root markdown file named `DEBUG_LOG.md`.
+  - Format each entry strictly as:
+    ### [Short Descriptive Heading of the Issue]
+    **Resolution Summary:** A single concise paragraph stating what caused the failure, the exact file or logic affected, and how the fix was implemented.
+  - Append new entries to the end of `DEBUG_LOG.md` without overwriting prior entries.
+
+## Git Commit & GitHub Push Protocol
+
+- Whenever a major architectural stage or user-approved build step is successfully completed and passes all verification checks (e.g., `npm run typecheck` or successful test runs):
+  - Strictly use concise, conventional scoped commit messages following these type definitions and patterns:
+    - `feat(<scope>):` New feature (e.g., `feat(billing): implement stage 2 multimodal extraction with gemini flash`)
+    - `fix(<scope>):` Bug fix (e.g., `fix(bridge): resolve media buffer timeout on large image uploads`)
+    - `tweak(<scope>):` Small adjustments or refactoring (e.g., `tweak(fastify): increase payload limit for voice notes`)
+    - `copy(<scope>):` Text or prompt copy updates (e.g., `copy(prompts): refine hinglish and telugu debt vocabulary mappings`)
+    - `docs(<scope>):` Documentation changes (e.g., `docs(schema): document pending_actions state transitions`)
+  - Stage the relevant project files and push the commit directly to GitHub using the configured GitHub tool/MCP.
+  - Inform the user of the final commit SHA and message once pushed.

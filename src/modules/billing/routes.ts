@@ -1,6 +1,7 @@
 import { FastifyInstance, FastifyPluginOptions, FastifyRequest, FastifyReply } from 'fastify';
 import { EvolutionWebhookPayload } from '../../types/evolution.js';
 import { offloadMediaToSupabase } from './bridge.js';
+import { extractBillFromMedia } from './extractor.js';
 
 /**
  * Background pipeline to process billing messages asynchronously
@@ -45,18 +46,67 @@ async function processInboundBillingMessage(
           '✅ Media successfully persisted to Supabase Storage'
         );
 
-        // TODO [Stage 2]: Forward media.buffer & media.storageUrl to Gemini 1.5 Flash ingestion
+        // Stage 2: Multimodal Gemini 1.5 Flash extraction
+        log.info({ messageId }, '🧠 Starting Gemini 1.5 Flash multimodal bill extraction...');
+        const extractedBill = await extractBillFromMedia({
+          buffer: media.buffer,
+          mimeType: media.mimeType,
+          text: messageContent.imageMessage?.caption,
+        });
+
+        log.info(
+          {
+            messageId,
+            customer: extractedBill.customer,
+            totalAmount: extractedBill.totalAmount,
+            paymentStatus: extractedBill.paymentStatus,
+            detectedLanguage: extractedBill.detectedLanguage,
+            itemsCount: extractedBill.items.length,
+            items: extractedBill.items,
+            rawTranscriptionOrOcr: extractedBill.rawTranscriptionOrOcr,
+            notes: extractedBill.confidenceNotes,
+          },
+          '🎉 Bill successfully extracted from media'
+        );
+
+        // TODO [Stage 3]: Insert draft bill & pending_action into Supabase, send confirmation buttons
       }
     } catch (err: unknown) {
       const errMsg = err instanceof Error ? err.message : String(err);
-      log.error({ messageId, error: errMsg }, '❌ Failed to offload media to Supabase Storage');
+      log.error({ messageId, error: errMsg }, '❌ Failed to process multimodal billing message');
     }
   } else if (messageContent.conversation || messageContent.extendedTextMessage?.text) {
     const textContent =
       messageContent.conversation || messageContent.extendedTextMessage?.text;
     log.info({ messageId, textContent }, '📝 Received text billing message');
 
-    // TODO [Stage 2]: Forward textContent to Gemini 1.5 Flash ingestion
+    try {
+      // Stage 2: Text Gemini 1.5 Flash extraction
+      log.info({ messageId }, '🧠 Starting Gemini 1.5 Flash text bill extraction...');
+      const extractedBill = await extractBillFromMedia({
+        text: textContent,
+        mimeType: 'text/plain',
+      });
+
+      log.info(
+        {
+          messageId,
+          customer: extractedBill.customer,
+          totalAmount: extractedBill.totalAmount,
+          paymentStatus: extractedBill.paymentStatus,
+          detectedLanguage: extractedBill.detectedLanguage,
+          itemsCount: extractedBill.items.length,
+          items: extractedBill.items,
+          rawTranscriptionOrOcr: extractedBill.rawTranscriptionOrOcr,
+        },
+        '🎉 Bill successfully extracted from text'
+      );
+
+      // TODO [Stage 3]: Insert draft bill & pending_action into Supabase, send confirmation buttons
+    } catch (err: unknown) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      log.error({ messageId, error: errMsg }, '❌ Failed to process text billing message');
+    }
   } else if (
     messageContent.buttonsResponseMessage ||
     messageContent.templateButtonReplyMessage
