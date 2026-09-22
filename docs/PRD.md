@@ -1,0 +1,5 @@
+- Dual WhatsApp Bot setup: Ingestion (Billing Bot) & BI (Manager Bot).
+- Multimodal handling (Voice, Handwritten Images, Text).
+- Immediate binary offloading to Supabase Storage before Meta URL expiration.
+- Human-in-the-loop WhatsApp button confirmation (Paid, Pending, Edit).
+- Dynamic Text-to-SQL with read-only permissions for manager analytical queries.

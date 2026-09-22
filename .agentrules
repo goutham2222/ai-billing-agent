@@ -1,0 +1,8 @@
+# Antigravity Developer & Architecture Rules
+
+- Runtime & Framework: Node.js (v20+), TypeScript, Fastify.
+- Webhook Ingestion: Return HTTP 200 OK immediately upon receiving an inbound webhook from Evolution API, then process binary offloading and AI parsing asynchronously.
+- State Persistence: Never use in-memory state. Use the Supabase `pending_actions` table keyed by `whatsapp_message_id` and `bill_id`.
+- Binary Handling: WhatsApp media URLs expire quickly. Download media streams and push to Supabase Storage immediately before passing public/signed URLs to Gemini.
+- Security: Never expose `SUPABASE_SERVICE_ROLE_KEY` to public clients. The Manager Bot Text-to-SQL logic must connect via a strictly read-only PostgreSQL role.
+- Multilingual Normalization: Support English, Hindi, and Telugu. Map terms like "baki", "udhaar", or "pending" explicitly to `payment_status: 'pending'`.
