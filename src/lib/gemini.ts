@@ -78,3 +78,63 @@ export async function generateStructuredJson<T>(
   const msg = lastError instanceof Error ? lastError.message : String(lastError);
   throw new Error(`Failed to generate structured JSON from Gemini across models: ${msg}`);
 }
+
+/**
+ * Helper with exponential backoff and fallback models to execute a Gemini call
+ * returning plain text or markdown output.
+ */
+export async function generatePlainText(
+  params: StructuredGenerationParams
+): Promise<string> {
+  const candidateModels = [
+    params.model,
+    env.GEMINI_MODEL,
+    'gemini-3.5-flash-lite',
+    'gemini-3.8-flash',
+  ].filter((m, i, arr): m is string => Boolean(m) && arr.indexOf(m) === i);
+
+  let lastError: unknown;
+
+  for (const model of candidateModels) {
+    let attempts = 0;
+    const maxAttempts = 2;
+
+    while (attempts < maxAttempts) {
+      attempts++;
+      try {
+        const response = await ai.models.generateContent({
+          model,
+          contents: params.contents,
+          config: {
+            systemInstruction: params.systemInstruction,
+            temperature: params.temperature ?? 0.2,
+          },
+        });
+
+        const text = response.text;
+        if (text) {
+          return text.trim();
+        }
+        throw new Error(`Gemini (${model}) returned an empty text response`);
+      } catch (err: unknown) {
+        lastError = err;
+        const errMsg = err instanceof Error ? err.message : String(err);
+
+        if (errMsg.includes('404') || errMsg.includes('NOT_FOUND')) {
+          break;
+        }
+
+        if ((errMsg.includes('503') || errMsg.includes('429')) && attempts < maxAttempts) {
+          await new Promise((resolve) => setTimeout(resolve, 1000 * attempts));
+          continue;
+        }
+
+        break;
+      }
+    }
+  }
+
+  const msg = lastError instanceof Error ? lastError.message : String(lastError);
+  throw new Error(`Failed to generate text from Gemini across models: ${msg}`);
+}
+

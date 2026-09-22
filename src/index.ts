@@ -1,6 +1,7 @@
 import Fastify from 'fastify';
 import { env } from './config/env.js';
 import { billingRoutes } from './modules/billing/routes.js';
+import { managerRoutes } from './modules/manager/routes.js';
 
 async function bootstrap() {
   const server = Fastify({
@@ -31,6 +32,7 @@ async function bootstrap() {
 
   // Register Webhook Routes
   await server.register(billingRoutes);
+  await server.register(managerRoutes);
 
   // Graceful shutdown handling
   const signals: NodeJS.Signals[] = ['SIGINT', 'SIGTERM'];
@@ -56,6 +58,7 @@ async function bootstrap() {
     });
     server.log.info(`🚀 Fastify server listening at ${address}`);
     server.log.info(`📦 Billing Webhook available at: ${address}/webhook/billing`);
+    server.log.info(`📊 Manager Webhook available at: ${address}/webhook/manager`);
   } catch (err) {
     server.log.error(err);
     process.exit(1);
