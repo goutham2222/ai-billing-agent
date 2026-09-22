@@ -22,6 +22,15 @@ export interface ListSection {
   rows: ListRowOption[];
 }
 
+export interface SendMediaParams {
+  number: string;
+  mediatype: 'image' | 'video' | 'document' | 'audio';
+  mimetype: string;
+  media: string; // URL or base64 data
+  fileName?: string;
+  caption?: string;
+}
+
 export class EvolutionClient {
   private http: AxiosInstance;
 
@@ -167,6 +176,27 @@ export class EvolutionClient {
     } catch (error: unknown) {
       const msg = error instanceof Error ? error.message : String(error);
       throw new Error(`Failed to send WhatsApp list via Evolution API (${instance}): ${msg}`);
+    }
+  }
+
+  /**
+   * Sends media (image, audio, document) to a WhatsApp recipient.
+   * Evolution API v2 endpoint: POST /message/sendMedia/{instance}
+   */
+  async sendMedia(instance: string, params: SendMediaParams): Promise<unknown> {
+    const formattedNumber = params.number.replace(/[^0-9]/g, '');
+    try {
+      return await this.postWithFallback(
+        (inst) => `/message/sendMedia/${inst}`,
+        instance,
+        {
+          ...params,
+          number: formattedNumber,
+        }
+      );
+    } catch (error: unknown) {
+      const msg = error instanceof Error ? error.message : String(error);
+      throw new Error(`Failed to send WhatsApp media via Evolution API (${instance}): ${msg}`);
     }
   }
 

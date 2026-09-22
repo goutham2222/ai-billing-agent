@@ -2,6 +2,8 @@ import { supabase } from '../../lib/supabase.js';
 import { evolution } from '../../lib/evolution.js';
 import { env } from '../../config/env.js';
 import { ExtractedBill } from './schemas.js';
+import { generateInvoicePdf, InvoiceItem } from '../invoicing/pdf-generator.js';
+import { uploadInvoicePdfToStorage } from '../invoicing/storage.js';
 
 export interface DraftAndPendingResult {
   customer: {
@@ -282,6 +284,112 @@ export async function sendConfirmationList(params: {
 export const sendConfirmationButtons = sendConfirmationList;
 
 /**
+ * Asynchronously generates the PDF receipt, uploads it to Supabase Storage,
+ * and sends it via WhatsApp document message to both store owner and customer.
+ */
+async function generateAndSendInvoice(params: {
+  billId: string;
+  billNo: number | string;
+  customerName: string;
+  customerPhone?: string;
+  totalAmount: number;
+  items: unknown;
+  paymentStatus: 'paid' | 'pending';
+  ownerPhone: string;
+}): Promise<void> {
+  const {
+    billId,
+    billNo,
+    customerName,
+    customerPhone,
+    totalAmount,
+    items,
+    paymentStatus,
+    ownerPhone,
+  } = params;
+
+  try {
+    const rawItems = Array.isArray(items) ? (items as InvoiceItem[]) : [];
+
+    // 1. Generate PDF receipt
+    const pdfBuffer = await generateInvoicePdf({
+      billNo: billNo || '1',
+      date: new Date(),
+      customer: {
+        name: customerName,
+        phone: customerPhone,
+      },
+      items: rawItems,
+      totalAmount,
+      paymentStatus,
+    });
+
+    // 2. Upload to Supabase Storage in 'invoices' bucket
+    const { invoiceUrl } = await uploadInvoicePdfToStorage({
+      billId,
+      billNo: billNo || '1',
+      pdfBuffer,
+    });
+
+    const statusBadge = paymentStatus === 'paid' ? 'PAID' : 'PENDING UDHAAR';
+    const cleanBillNo = billNo ? `#${billNo}` : '';
+
+    // 3. Send PDF document to Store Owner
+    if (ownerPhone) {
+      try {
+        await evolution.sendMedia(env.BILLING_INSTANCE_NAME, {
+          number: ownerPhone,
+          mediatype: 'document',
+          mimetype: 'application/pdf',
+          media: invoiceUrl,
+          fileName: `Invoice_${billNo || 'bill'}.pdf`,
+          caption: `🧾 *Invoice ${cleanBillNo} - ${customerName}*\n💰 Total: Rs. ${totalAmount}\n📌 Status: ${statusBadge}`,
+        });
+      } catch (ownerSendErr: unknown) {
+        console.warn(
+          `[Invoice Dispatch] Failed to send PDF to owner: ${
+            ownerSendErr instanceof Error ? ownerSendErr.message : String(ownerSendErr)
+          }`
+        );
+      }
+    }
+
+    // 4. Send PDF copy to Customer (if valid WhatsApp number)
+    const cleanCustomerPhone = customerPhone ? customerPhone.replace(/[^0-9]/g, '') : '';
+    const hasValidCustomerPhone =
+      cleanCustomerPhone &&
+      cleanCustomerPhone.length >= 10 &&
+      !customerPhone?.startsWith('walkin-');
+
+    if (hasValidCustomerPhone) {
+      try {
+        const customerGreeting =
+          paymentStatus === 'paid'
+            ? `🧾 *Tax Invoice / Receipt ${cleanBillNo}*\nDear ${customerName}, here is your receipt for Rs. ${totalAmount}. Payment received with thanks!`
+            : `🧾 *Invoice ${cleanBillNo}*\nDear ${customerName}, here is your invoice for Rs. ${totalAmount} recorded as Pending Udhaar. Thank you!`;
+
+        await evolution.sendMedia(env.BILLING_INSTANCE_NAME, {
+          number: cleanCustomerPhone,
+          mediatype: 'document',
+          mimetype: 'application/pdf',
+          media: invoiceUrl,
+          fileName: `Invoice_${billNo || 'bill'}.pdf`,
+          caption: customerGreeting,
+        });
+      } catch (custSendErr: unknown) {
+        console.warn(
+          `[Invoice Dispatch] Failed to send PDF to customer (${customerPhone}): ${
+            custSendErr instanceof Error ? custSendErr.message : String(custSendErr)
+          }`
+        );
+      }
+    }
+  } catch (err: unknown) {
+    console.error(`[Invoice Hook] PDF generation or dispatch failed for bill ${billId}:`, err);
+  }
+}
+
+/**
  * Resolves an owner's button click reply and updates the pending action
  * and bill status in the database.
  */
@@ -346,6 +454,23 @@ export async function handleButtonConfirmation(params: {
 
     const confirmationText = `✅ *Bill ${billNo} Confirmed: PAID*\n👤 Customer: *${customerName}*\n💰 Amount: *₹${totalAmount}*\nPayment recorded as cleared.`;
     await safeSendTextMessage(senderPhone, confirmationText);
+
+    // Stage 5 Hook: Trigger PDF generation & WhatsApp dispatch
+    if (billId) {
+      setImmediate(() => {
+        generateAndSendInvoice({
+          billId,
+          billNo: billData.bill_no || billNo.replace('#', '') || '1',
+          customerName,
+          customerPhone: billData.customer_phone,
+          totalAmount,
+          items: billData.items,
+          paymentStatus: 'paid',
+          ownerPhone: senderPhone,
+        }).catch((err) => console.error('[Invoice Background Hook Error]:', err));
+      });
+    }
+
     return { success: true, message: confirmationText };
   }
 
@@ -365,6 +490,23 @@ export async function handleButtonConfirmation(params: {
 
     const confirmationText = `⏳ *Bill ${billNo} Confirmed: UDHAAR (Pending)*\n👤 Customer: *${customerName}*\n💰 Amount: *₹${totalAmount}*\nRecorded into customer ledger as pending debt.`;
     await safeSendTextMessage(senderPhone, confirmationText);
+
+    // Stage 5 Hook: Trigger PDF generation & WhatsApp dispatch
+    if (billId) {
+      setImmediate(() => {
+        generateAndSendInvoice({
+          billId,
+          billNo: billData.bill_no || billNo.replace('#', '') || '1',
+          customerName,
+          customerPhone: billData.customer_phone,
+          totalAmount,
+          items: billData.items,
+          paymentStatus: 'pending',
+          ownerPhone: senderPhone,
+        }).catch((err) => console.error('[Invoice Background Hook Error]:', err));
+      });
+    }
+
     return { success: true, message: confirmationText };
   }
 

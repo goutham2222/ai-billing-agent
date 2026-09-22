@@ -65,3 +65,16 @@ export function cleanManagerQuery(rawText: string): string {
   const trimmed = rawText.trim();
   return trimmed.replace(PREFIX_REGEX, '').trim() || trimmed;
 }
+
+// 4. Customer Udhaar reminder commands
+const REMINDER_REGEX = /^(?:send\s+reminder\s+to|remind\s*:?|reminder\s+for)\b/i;
+
+/**
+ * Checks whether a text message is a command to send an Udhaar payment reminder to a customer.
+ */
+export function isReminderCommand(rawText: string): boolean {
+  if (!rawText) return false;
+  return REMINDER_REGEX.test(rawText.trim());
+}
+
+

@@ -10,8 +10,13 @@ import {
 import { env } from '../../config/env.js';
 import { supabase } from '../../lib/supabase.js';
 import { evolution } from '../../lib/evolution.js';
-import { isManagerQuery, cleanManagerQuery } from '../routing/classifier.js';
+import {
+  isManagerQuery,
+  cleanManagerQuery,
+  isReminderCommand,
+} from '../routing/classifier.js';
 import { isAuthorizedManager, executeManagerQuery } from '../manager/routes.js';
+import { handleCustomerReminder } from '../invoicing/reminders.js';
 
 /**
  * Background pipeline to process billing messages asynchronously
@@ -214,6 +219,38 @@ async function processInboundBillingMessage(
         });
         return;
       }
+    }
+
+    // Check if the text is a Customer Payment Reminder command (e.g. "remind Ramesh", "send reminder to Suresh")
+    if (isReminderCommand(textContent)) {
+      log.info(
+        { messageId, senderPhone, textContent },
+        '🔔 Detected customer payment reminder command'
+      );
+
+      if (!isAuthorizedManager(senderPhone)) {
+        log.warn(
+          { messageId, senderPhone },
+          '⛔ Unauthorized reminder attempt on primary webhook'
+        );
+        try {
+          await evolution.sendTextMessage(
+            instance,
+            senderPhone,
+            '⛔ *Access Denied*\nPayment reminder commands are restricted to the authorized store owner.'
+          );
+        } catch (err: unknown) {
+          log.warn({ err }, 'Failed to send unauthorized notice');
+        }
+        return;
+      }
+
+      await handleCustomerReminder({
+        rawCommand: textContent,
+        ownerPhone: senderPhone,
+        instance,
+      });
+      return;
     }
 
     // Intent Classification: Check if message is a Manager analytical query
