@@ -26,6 +26,36 @@ export class EvolutionClient {
   }
 
   /**
+   * Helper to perform requests with automatic fallback between hyphenated
+   * and underscored instance names if a 404 Not Found error is returned.
+   */
+  private async postWithFallback<T = unknown>(
+    pathGenerator: (instance: string) => string,
+    instance: string,
+    data: unknown
+  ): Promise<T> {
+    try {
+      const response = await this.http.post<T>(pathGenerator(instance), data);
+      return response.data;
+    } catch (err: unknown) {
+      if (axios.isAxiosError(err) && err.response?.status === 404) {
+        // Try alternating hyphens and underscores
+        const altInstance = instance.includes('_')
+          ? instance.replace(/_/g, '-')
+          : instance.includes('-')
+          ? instance.replace(/-/g, '_')
+          : null;
+
+        if (altInstance && altInstance !== instance) {
+          const altResponse = await this.http.post<T>(pathGenerator(altInstance), data);
+          return altResponse.data;
+        }
+      }
+      throw err;
+    }
+  }
+
+  /**
    * Fetches base64 binary buffer for an encrypted WhatsApp media message.
    * Evolution API v2 requires the full message object (including `key` and `message` contents)
    * in the request body: `{ message: rawMessageObject, convertToMp4: false }`.
@@ -46,12 +76,14 @@ export class EvolutionClient {
           ? (rawMessage as Record<string, unknown>).message
           : rawMessage;
 
-      const response = await this.http.post(`/chat/getBase64FromMediaMessage/${instance}`, {
-        message: messagePayload,
-        convertToMp4: false,
-      });
-
-      const data = response.data as { base64?: string; mimetype?: string } | string;
+      const data = await this.postWithFallback<{ base64?: string; mimetype?: string } | string>(
+        (inst) => `/chat/getBase64FromMediaMessage/${inst}`,
+        instance,
+        {
+          message: messagePayload,
+          convertToMp4: false,
+        }
+      );
 
       if (typeof data === 'string') {
         return {
@@ -79,11 +111,19 @@ export class EvolutionClient {
    */
   async sendTextMessage(instance: string, to: string, text: string): Promise<unknown> {
     const formattedNumber = to.replace(/[^0-9]/g, '');
-    const response = await this.http.post(`/message/sendText/${instance}`, {
-      number: formattedNumber,
-      text,
-    });
-    return response.data;
+    try {
+      return await this.postWithFallback(
+        (inst) => `/message/sendText/${inst}`,
+        instance,
+        {
+          number: formattedNumber,
+          text,
+        }
+      );
+    } catch (error: unknown) {
+      const msg = error instanceof Error ? error.message : String(error);
+      throw new Error(`Failed to send WhatsApp text via Evolution API (${instance}): ${msg}`);
+    }
   }
 
   /**
@@ -98,18 +138,26 @@ export class EvolutionClient {
     footer?: string
   ): Promise<unknown> {
     const formattedNumber = to.replace(/[^0-9]/g, '');
-    const response = await this.http.post(`/message/sendButtons/${instance}`, {
-      number: formattedNumber,
-      title,
-      description,
-      footer: footer || 'AI Billing Agent',
-      buttons: buttons.map((b) => ({
-        type: 'reply',
-        displayText: b.text,
-        id: b.id,
-      })),
-    });
-    return response.data;
+    try {
+      return await this.postWithFallback(
+        (inst) => `/message/sendButtons/${inst}`,
+        instance,
+        {
+          number: formattedNumber,
+          title,
+          description,
+          footer: footer || 'AI Billing Agent',
+          buttons: buttons.map((b) => ({
+            type: 'reply',
+            displayText: b.text,
+            id: b.id,
+          })),
+        }
+      );
+    } catch (error: unknown) {
+      const msg = error instanceof Error ? error.message : String(error);
+      throw new Error(`Failed to send WhatsApp buttons via Evolution API (${instance}): ${msg}`);
+    }
   }
 }
 
