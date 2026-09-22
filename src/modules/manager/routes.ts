@@ -6,6 +6,64 @@ import { generateSqlFromQuestion } from './sql-generator.js';
 import { executeAndFormatQuery } from './executor.js';
 
 /**
+ * Checks whether the sender is authorized to query managerial business intelligence.
+ */
+export function isAuthorizedManager(senderPhone: string): boolean {
+  const ownerPhone = env.STORE_OWNER_PHONE ? env.STORE_OWNER_PHONE.replace(/[^0-9]/g, '') : '';
+  if (!ownerPhone) {
+    return true;
+  }
+  const cleanSender = senderPhone.replace(/[^0-9]/g, '');
+  const ownerLast10 = ownerPhone.slice(-10);
+  const senderLast10 = cleanSender.slice(-10);
+  return cleanSender === ownerPhone || (ownerLast10.length === 10 && senderLast10 === ownerLast10);
+}
+
+/**
+ * Executes a manager query (Text-to-SQL -> safe query -> formatted report)
+ * and dispatches the response via Evolution API.
+ */
+export async function executeManagerQuery(params: {
+  question: string;
+  senderPhone: string;
+  instance: string;
+  log?: FastifyInstance['log'];
+}): Promise<void> {
+  const { question, senderPhone, instance, log } = params;
+
+  try {
+    log?.info({ senderPhone, question }, '🔍 Processing manager analytics query...');
+
+    // 1. Generate sanitized read-only SQL via Gemini
+    const { sql, explanation } = await generateSqlFromQuestion(question);
+    log?.info({ sql, explanation }, '⚡ Generated safe SQL query');
+
+    // 2. Execute query & format natural response
+    const report = await executeAndFormatQuery({
+      question,
+      sql,
+      explanation,
+    });
+
+    // 3. Send formatted summary back via Evolution API
+    await evolution.sendTextMessage(instance, senderPhone, report);
+    log?.info({ senderPhone }, '✅ Analytics report successfully dispatched');
+  } catch (err: unknown) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    log?.error({ error: errMsg }, '❌ Failed to process manager analytics query');
+
+    if (senderPhone) {
+      const errorReply = `⚠️ *Analytics Assistant Notice*\n\nUnable to answer: ${errMsg}\n\n_Tip: Try asking questions like "Today's sales", "Who owes udhaar?", or "ఈరోజు అమ్మకాలు ఎంత?"._`;
+      try {
+        await evolution.sendTextMessage(instance, senderPhone, errorReply);
+      } catch (sendErr: unknown) {
+        log?.warn({ sendErr }, 'Failed to send error notification back to manager');
+      }
+    }
+  }
+}
+
+/**
  * Handles incoming WhatsApp messages from the Manager Bot instance
  * for Text-to-SQL business intelligence queries.
  */
@@ -23,34 +81,25 @@ async function processInboundManagerMessage(
   }
 
   const senderPhone = sender ? sender.replace(/[^0-9]/g, '') : '';
-  const ownerPhone = env.STORE_OWNER_PHONE ? env.STORE_OWNER_PHONE.replace(/[^0-9]/g, '') : '';
 
   // 1. Authorization: Only allow registered store owner to query manager bot
-  if (ownerPhone) {
-    const ownerLast10 = ownerPhone.slice(-10);
-    const senderLast10 = senderPhone.slice(-10);
-    const isAuthorized =
-      senderPhone === ownerPhone ||
-      (ownerLast10.length === 10 && senderLast10 === ownerLast10);
-
-    if (!isAuthorized) {
-      log.warn(
-        { messageId, senderPhone, ownerPhone },
-        '⛔ Unauthorized access attempt to Manager Bot'
-      );
-      if (senderPhone) {
-        try {
-          await evolution.sendTextMessage(
-            instance || env.MANAGER_INSTANCE_NAME,
-            senderPhone,
-            '⛔ *Access Denied*\nThis Manager Assistant is strictly restricted to the authorized store owner.'
-          );
-        } catch (err: unknown) {
-          log.warn({ err }, 'Failed to send unauthorized notice');
-        }
+  if (!isAuthorizedManager(senderPhone)) {
+    log.warn(
+      { messageId, senderPhone },
+      '⛔ Unauthorized access attempt to Manager Bot'
+    );
+    if (senderPhone) {
+      try {
+        await evolution.sendTextMessage(
+          instance || env.MANAGER_INSTANCE_NAME,
+          senderPhone,
+          '⛔ *Access Denied*\nThis Manager Assistant is strictly restricted to the authorized store owner.'
+        );
+      } catch (err: unknown) {
+        log.warn({ err }, 'Failed to send unauthorized notice');
       }
-      return;
     }
+    return;
   }
 
   // 2. Extract natural language text query
@@ -63,45 +112,12 @@ async function processInboundManagerMessage(
     return;
   }
 
-  log.info({ messageId, senderPhone, question: textContent }, '🔍 Processing manager analytics query...');
-
-  try {
-    // 3. Generate sanitized read-only SQL via Gemini
-    const { sql, explanation } = await generateSqlFromQuestion(textContent);
-    log.info({ messageId, sql, explanation }, '⚡ Generated safe SQL query');
-
-    // 4. Execute query & format natural response
-    const report = await executeAndFormatQuery({
-      question: textContent,
-      sql,
-      explanation,
-    });
-
-    // 5. Send formatted summary back via Evolution API
-    await evolution.sendTextMessage(
-      instance || env.MANAGER_INSTANCE_NAME,
-      senderPhone,
-      report
-    );
-
-    log.info({ messageId, senderPhone }, '✅ Analytics report successfully dispatched to owner');
-  } catch (err: unknown) {
-    const errMsg = err instanceof Error ? err.message : String(err);
-    log.error({ messageId, error: errMsg }, '❌ Failed to process manager analytics query');
-
-    if (senderPhone) {
-      const errorReply = `⚠️ *Analytics Assistant Notice*\n\nUnable to answer: ${errMsg}\n\n_Tip: Try asking questions like "Today's sales", "Who owes udhaar?", or "ఈరోజు అమ్మకాలు ఎంత?"._`;
-      try {
-        await evolution.sendTextMessage(
-          instance || env.MANAGER_INSTANCE_NAME,
-          senderPhone,
-          errorReply
-        );
-      } catch (sendErr: unknown) {
-        log.warn({ sendErr }, 'Failed to send error notification back to manager');
-      }
-    }
-  }
+  await executeManagerQuery({
+    question: textContent,
+    senderPhone,
+    instance: instance || env.MANAGER_INSTANCE_NAME,
+    log,
+  });
 }
 
 export async function managerRoutes(

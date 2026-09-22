@@ -9,6 +9,9 @@ import {
 } from './state.js';
 import { env } from '../../config/env.js';
 import { supabase } from '../../lib/supabase.js';
+import { evolution } from '../../lib/evolution.js';
+import { isManagerQuery, cleanManagerQuery } from '../routing/classifier.js';
+import { isAuthorizedManager, executeManagerQuery } from '../manager/routes.js';
 
 /**
  * Background pipeline to process billing messages asynchronously
@@ -211,6 +214,41 @@ async function processInboundBillingMessage(
         });
         return;
       }
+    }
+
+    // Intent Classification: Check if message is a Manager analytical query
+    if (isManagerQuery(textContent)) {
+      log.info(
+        { messageId, senderPhone, textContent },
+        '🧠 Classified message as Manager query on unified bot account'
+      );
+
+      // Authorization Check: Only allow if sender matches STORE_OWNER_PHONE
+      if (!isAuthorizedManager(senderPhone)) {
+        log.warn(
+          { messageId, senderPhone },
+          '⛔ Unauthorized manager query attempt on primary webhook'
+        );
+        try {
+          await evolution.sendTextMessage(
+            instance,
+            senderPhone,
+            '⛔ *Access Denied*\nManager analytical queries are strictly restricted to the authorized store owner.'
+          );
+        } catch (err: unknown) {
+          log.warn({ err }, 'Failed to send unauthorized notice');
+        }
+        return;
+      }
+
+      const cleanQuery = cleanManagerQuery(textContent);
+      await executeManagerQuery({
+        question: cleanQuery,
+        senderPhone,
+        instance,
+        log,
+      });
+      return;
     }
 
     try {

@@ -24,3 +24,4 @@ ALTER ROLE readonly_user SET default_transaction_read_only = 'on';
 
 -- Usage in .env:
 -- READONLY_DATABASE_URL=postgresql://readonly_user:CHANGE_THIS_TO_SECURE_PASSWORD@db.PROJECT_REF.supabase.co:5432/postgres
+
