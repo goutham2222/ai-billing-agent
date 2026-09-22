@@ -43,6 +43,19 @@ export interface StoredBillData {
 }
 
 /**
+ * Normalizes phone numbers for WhatsApp delivery and consistent lookup.
+ * Automatically adds the 91 country code to 10-digit Indian mobile numbers.
+ */
+export function normalizePhoneNumber(phone?: string): string {
+  if (!phone) return '';
+  const clean = phone.replace(/[^0-9]/g, '');
+  if (clean.length === 10 && /^[6-9]/.test(clean)) {
+    return `91${clean}`;
+  }
+  return clean;
+}
+
+/**
  * Safely sends a WhatsApp text message without throwing if the number is offline/invalid.
  */
 async function safeSendTextMessage(phone: string, text: string): Promise<void> {
@@ -72,13 +85,19 @@ export async function createDraftAndPendingAction(params: {
   let customer: { id: string; name: string; phone: string } | null = null;
   const rawCustomerName = extractedBill.customer.name?.trim() || 'Walk-in Customer';
   const rawPhone = extractedBill.customer.phone?.replace(/[^0-9]/g, '');
+  const normalizedPhone = normalizePhoneNumber(extractedBill.customer.phone);
 
   // 1a. Try lookup by phone if phone was provided
-  if (rawPhone && rawPhone.length >= 7) {
+  if (normalizedPhone && normalizedPhone.length >= 7) {
+    const filterQuery = rawPhone && rawPhone !== normalizedPhone
+      ? `phone.eq.${normalizedPhone},phone.eq.${rawPhone}`
+      : `phone.eq.${normalizedPhone}`;
+
     const { data: byPhone, error: phoneErr } = await supabase
       .from('customers')
       .select('id, name, phone')
-      .eq('phone', rawPhone)
+      .or(filterQuery)
+      .limit(1)
       .maybeSingle();
 
     if (!phoneErr && byPhone) {
@@ -109,9 +128,9 @@ export async function createDraftAndPendingAction(params: {
         ? 'Hindi'
         : 'English';
 
-    // Satisfy not-null and unique constraint on phone
-    const fallbackPhone = rawPhone && rawPhone.length >= 7
-      ? rawPhone
+    // Satisfy not-null and unique constraint on phone with normalized phone number
+    const fallbackPhone = normalizedPhone && normalizedPhone.length >= 7
+      ? normalizedPhone
       : `walkin-${Date.now().toString().slice(-6)}-${Math.floor(100 + Math.random() * 900)}`;
 
     const { data: newCustomer, error: insertCustErr } = await supabase
@@ -197,7 +216,7 @@ export async function sendConfirmationList(params: {
   pendingActionId: string;
   extractedBill: ExtractedBill;
 }): Promise<unknown> {
-  const { ownerPhone, bill, pendingActionId, extractedBill } = params;
+  const { ownerPhone, bill, pendingActionId: _pendingActionId, extractedBill } = params;
   const customerName = extractedBill.customer.name?.trim() || 'Customer';
 
   // Build items formatted list
@@ -237,47 +256,26 @@ export async function sendConfirmationList(params: {
     .filter((line) => line !== '')
     .join('\n');
 
-  // 3. Section rows
-  const sections = [
-    {
-      title: 'Select Action',
-      rows: [
-        {
-          rowId: `action_paid_${pendingActionId}`,
-          title: '✅ Confirm Paid',
-          description: 'Mark bill as settled',
-        },
-        {
-          rowId: `action_pending_${pendingActionId}`,
-          title: '⏳ Confirm Udhaar',
-          description: 'Add to customer debt ledger',
-        },
-        {
-          rowId: `action_reject_${pendingActionId}`,
-          title: '❌ Cancel / Reject',
-          description: 'Discard this draft',
-        },
-      ],
-    },
-  ];
+  // 3. Structured text card with direct reply instructions
+  const cardText = `${title}\n\n${description}\n\n👉 *Reply with 1 (Paid), 2 (Udhaar), or 3 (Cancel)*`;
+  await safeSendTextMessage(ownerPhone, cardText);
 
+  // 4. Also dispatch a native interactive WhatsApp Poll for one-tap confirmation
   try {
-    return await evolution.sendList(
+    const pollTitle = `Confirm Bill${billNumberText}: ${customerName} (₹${extractedBill.totalAmount})`;
+    await evolution.sendPoll(
       env.BILLING_INSTANCE_NAME,
       ownerPhone,
-      title,
-      description,
-      'Select Action',
-      sections,
-      'AI Billing Agent'
+      pollTitle,
+      ['1. Confirm Paid', '2. Confirm Udhaar', '3. Reject / Cancel'],
+      1
     );
-  } catch (listError: unknown) {
-    const errorMsg = listError instanceof Error ? listError.message : String(listError);
-    console.warn(`[Evolution List] sendList failed (${errorMsg}), falling back to text`);
-    // Enhanced text fallback with explicit reply instructions
-    const fallbackText = `${title}\n\n${description}\n\nReply with 1 (Paid), 2 (Udhaar), or 3 (Cancel)`;
-    return await safeSendTextMessage(ownerPhone, fallbackText);
+  } catch (pollErr: unknown) {
+    const msg = pollErr instanceof Error ? pollErr.message : String(pollErr);
+    console.debug(`[Evolution Poll] Native poll dispatch skipped or unconfirmed: ${msg}`);
   }
+
+  return { success: true };
 }
 
 // Retain alias for backward compatibility
@@ -286,6 +284,7 @@ export const sendConfirmationButtons = sendConfirmationList;
 /**
  * Asynchronously generates the PDF receipt, uploads it to Supabase Storage,
  * and sends it via WhatsApp document message to both store owner and customer.
+ * Uses direct in-memory base64 encoding to bypass container-level HTTP fetch timeouts.
  */
 async function generateAndSendInvoice(params: {
   billId: string;
@@ -311,7 +310,7 @@ async function generateAndSendInvoice(params: {
   try {
     const rawItems = Array.isArray(items) ? (items as InvoiceItem[]) : [];
 
-    // 1. Generate PDF receipt
+    // 1. Generate PDF receipt buffer
     const pdfBuffer = await generateInvoicePdf({
       billNo: billNo || '1',
       date: new Date(),
@@ -324,7 +323,7 @@ async function generateAndSendInvoice(params: {
       paymentStatus,
     });
 
-    // 2. Upload to Supabase Storage in 'invoices' bucket
+    // 2. Upload to Supabase Storage in 'invoices' bucket and save URL in bills table
     const { invoiceUrl } = await uploadInvoicePdfToStorage({
       billId,
       billNo: billNo || '1',
@@ -333,55 +332,74 @@ async function generateAndSendInvoice(params: {
 
     const statusBadge = paymentStatus === 'paid' ? 'PAID' : 'PENDING UDHAAR';
     const cleanBillNo = billNo ? `#${billNo}` : '';
+    const pdfBase64 = pdfBuffer.toString('base64');
 
-    // 3. Send PDF document to Store Owner
+    // 3. Send PDF document to Store Owner using fast base64 payload
     if (ownerPhone) {
       try {
         await evolution.sendMedia(env.BILLING_INSTANCE_NAME, {
           number: ownerPhone,
           mediatype: 'document',
           mimetype: 'application/pdf',
-          media: invoiceUrl,
+          media: pdfBase64,
           fileName: `Invoice_${billNo || 'bill'}.pdf`,
           caption: `🧾 *Invoice ${cleanBillNo} - ${customerName}*\n💰 Total: Rs. ${totalAmount}\n📌 Status: ${statusBadge}`,
         });
       } catch (ownerSendErr: unknown) {
-        console.warn(
-          `[Invoice Dispatch] Failed to send PDF to owner: ${
-            ownerSendErr instanceof Error ? ownerSendErr.message : String(ownerSendErr)
-          }`
-        );
+        // Fallback to public storage URL if base64 fails
+        try {
+          await evolution.sendMedia(env.BILLING_INSTANCE_NAME, {
+            number: ownerPhone,
+            mediatype: 'document',
+            mimetype: 'application/pdf',
+            media: invoiceUrl,
+            fileName: `Invoice_${billNo || 'bill'}.pdf`,
+            caption: `🧾 *Invoice ${cleanBillNo} - ${customerName}*\n💰 Total: Rs. ${totalAmount}\n📌 Status: ${statusBadge}`,
+          });
+        } catch (fallbackErr: unknown) {
+          const msg = fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr);
+          console.warn(`[Invoice Dispatch] Failed to send PDF to owner: ${msg}`);
+        }
       }
     }
 
-    // 4. Send PDF copy to Customer (if valid WhatsApp number)
-    const cleanCustomerPhone = customerPhone ? customerPhone.replace(/[^0-9]/g, '') : '';
+    // 4. Send PDF copy to Customer (with normalized country-coded phone)
+    const cleanCustomerPhone = normalizePhoneNumber(customerPhone);
     const hasValidCustomerPhone =
       cleanCustomerPhone &&
       cleanCustomerPhone.length >= 10 &&
       !customerPhone?.startsWith('walkin-');
 
     if (hasValidCustomerPhone) {
-      try {
-        const customerGreeting =
-          paymentStatus === 'paid'
-            ? `🧾 *Tax Invoice / Receipt ${cleanBillNo}*\nDear ${customerName}, here is your receipt for Rs. ${totalAmount}. Payment received with thanks!`
-            : `🧾 *Invoice ${cleanBillNo}*\nDear ${customerName}, here is your invoice for Rs. ${totalAmount} recorded as Pending Udhaar. Thank you!`;
+      const customerGreeting =
+        paymentStatus === 'paid'
+          ? `🧾 *Tax Invoice / Receipt ${cleanBillNo}*\nDear ${customerName}, here is your receipt for Rs. ${totalAmount}. Payment received with thanks!`
+          : `🧾 *Invoice ${cleanBillNo}*\nDear ${customerName}, here is your invoice for Rs. ${totalAmount} recorded as Pending Udhaar. Thank you!`;
 
+      try {
         await evolution.sendMedia(env.BILLING_INSTANCE_NAME, {
           number: cleanCustomerPhone,
           mediatype: 'document',
           mimetype: 'application/pdf',
-          media: invoiceUrl,
+          media: pdfBase64,
           fileName: `Invoice_${billNo || 'bill'}.pdf`,
           caption: customerGreeting,
         });
       } catch (custSendErr: unknown) {
-        console.warn(
-          `[Invoice Dispatch] Failed to send PDF to customer (${customerPhone}): ${
-            custSendErr instanceof Error ? custSendErr.message : String(custSendErr)
-          }`
-        );
+        // Fallback to public storage URL
+        try {
+          await evolution.sendMedia(env.BILLING_INSTANCE_NAME, {
+            number: cleanCustomerPhone,
+            mediatype: 'document',
+            mimetype: 'application/pdf',
+            media: invoiceUrl,
+            fileName: `Invoice_${billNo || 'bill'}.pdf`,
+            caption: customerGreeting,
+          });
+        } catch (fallbackCustErr: unknown) {
+          const msg = fallbackCustErr instanceof Error ? fallbackCustErr.message : String(fallbackCustErr);
+          console.warn(`[Invoice Dispatch] Failed to send PDF to customer (${customerPhone}): ${msg}`);
+        }
       }
     }
   } catch (err: unknown) {

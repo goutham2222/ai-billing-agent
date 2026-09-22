@@ -233,6 +233,35 @@ export class EvolutionClient {
       throw new Error(`Failed to send WhatsApp buttons via Evolution API (${instance}): ${msg}`);
     }
   }
+
+  /**
+   * Sends an interactive native poll message to a WhatsApp recipient.
+   * Evolution API v2 endpoint: POST /message/sendPoll/{instance}
+   */
+  async sendPoll(
+    instance: string,
+    to: string,
+    name: string,
+    options: string[],
+    selectableCount = 1
+  ): Promise<unknown> {
+    const formattedNumber = to.replace(/[^0-9]/g, '');
+    try {
+      return await this.postWithFallback(
+        (inst) => `/message/sendPoll/${inst}`,
+        instance,
+        {
+          number: formattedNumber,
+          name,
+          selectableCount,
+          values: options,
+        }
+      );
+    } catch (error: unknown) {
+      const msg = error instanceof Error ? error.message : String(error);
+      throw new Error(`Failed to send WhatsApp poll via Evolution API (${instance}): ${msg}`);
+    }
+  }
 }
 
 export const evolution = new EvolutionClient();

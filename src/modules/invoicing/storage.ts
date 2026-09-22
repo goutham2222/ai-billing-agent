@@ -5,6 +5,28 @@ export interface UploadInvoiceResult {
   invoiceUrl: string;
 }
 
+let bucketVerified = false;
+
+async function ensureInvoicesBucket(): Promise<void> {
+  if (bucketVerified) return;
+  try {
+    const { data: buckets } = await supabase.storage.listBuckets();
+    const invoiceBucket = buckets?.find((b) => b.id === 'invoices' || b.name === 'invoices');
+    if (!invoiceBucket) {
+      await supabase.storage.createBucket('invoices', {
+        public: true,
+        allowedMimeTypes: ['application/pdf'],
+        fileSizeLimit: 10 * 1024 * 1024,
+      });
+    } else if (!invoiceBucket.public) {
+      await supabase.storage.updateBucket('invoices', { public: true });
+    }
+    bucketVerified = true;
+  } catch (err: unknown) {
+    console.warn('[Invoice Storage] Could not verify/update invoices bucket:', err);
+  }
+}
+
 /**
  * Uploads a generated PDF invoice buffer to the Supabase Storage 'invoices' bucket
  * and persists the public invoice URL to the bills table.
@@ -17,6 +39,8 @@ export async function uploadInvoicePdfToStorage(params: {
   const { billId, billNo, pdfBuffer } = params;
   const fileName = `${billNo}_${Date.now()}.pdf`;
   const storagePath = `bills/${fileName}`;
+
+  await ensureInvoicesBucket();
 
   // 1. Upload PDF binary to Supabase Storage in 'invoices' bucket
   const { data: uploadData, error: uploadError } = await supabase.storage
@@ -54,3 +78,4 @@ export async function uploadInvoicePdfToStorage(params: {
     invoiceUrl,
   };
 }
+

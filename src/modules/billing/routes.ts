@@ -19,6 +19,48 @@ import { isAuthorizedManager, executeManagerQuery } from '../manager/routes.js';
 import { handleCustomerReminder } from '../invoicing/reminders.js';
 
 /**
+ * Resolves the most recent pending bill action for an owner given a confirmed choice.
+ */
+async function resolvePendingBillAction(
+  ownerPhone: string,
+  choice: 'paid' | 'pending' | 'reject'
+): Promise<boolean> {
+  let { data: latestPending } = await supabase
+    .from('pending_actions')
+    .select('*')
+    .eq('owner_phone', ownerPhone)
+    .eq('status', 'awaiting_confirmation')
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  // Fallback matching if ownerPhone has or lacks country code
+  if (!latestPending) {
+    const last10 = ownerPhone.slice(-10);
+    if (last10.length === 10) {
+      const { data: fallbackPending } = await supabase
+        .from('pending_actions')
+        .select('*')
+        .ilike('owner_phone', `%${last10}`)
+        .eq('status', 'awaiting_confirmation')
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      latestPending = fallbackPending;
+    }
+  }
+
+  if (latestPending) {
+    await handleButtonConfirmation({
+      selectedButtonId: `action_${choice}_${latestPending.whatsapp_message_id}`,
+      senderPhone: ownerPhone,
+    });
+    return true;
+  }
+  return false;
+}
+
+/**
  * Background pipeline to process billing messages asynchronously
  * without delaying the webhook HTTP response.
  */
@@ -33,15 +75,43 @@ async function processInboundBillingMessage(
 
   log.info({ event, instance, messageId, sender }, '🔄 Processing billing webhook payload in background');
 
+  const senderPhone = sender ? sender.replace(/[^0-9]/g, '') : (env.STORE_OWNER_PHONE || '');
+  const ownerPhone = env.STORE_OWNER_PHONE || senderPhone;
+
+  // 1a. Check for native WhatsApp Poll votes (pollUpdateMessage)
+  const rawPollUpdates = (data as any)?.pollUpdates;
+  if (
+    data?.messageType === 'pollUpdateMessage' ||
+    (Array.isArray(rawPollUpdates) && rawPollUpdates.length > 0)
+  ) {
+    const votedOption = Array.isArray(rawPollUpdates)
+      ? rawPollUpdates.find((opt: any) => Array.isArray(opt.voters) && opt.voters.length > 0)
+      : null;
+
+    if (votedOption && typeof votedOption.name === 'string') {
+      const optName = votedOption.name.toLowerCase();
+      const isPaid = optName.includes('paid') || optName.startsWith('1');
+      const isPending = optName.includes('udhaar') || optName.includes('pending') || optName.startsWith('2');
+      const isCancel = optName.includes('reject') || optName.includes('cancel') || optName.startsWith('3');
+
+      if (isPaid || isPending || isCancel) {
+        const choice = isPaid ? 'paid' : isPending ? 'pending' : 'reject';
+        log.info(
+          { messageId, choice, votedOption: votedOption.name, ownerPhone },
+          '🔘 Resolving pending bill action via native WhatsApp poll update'
+        );
+        const resolved = await resolvePendingBillAction(ownerPhone, choice);
+        if (resolved) return;
+      }
+    }
+  }
+
   if (!messageContent) {
     log.debug({ messageId }, 'No message content found, skipping');
     return;
   }
 
-  const senderPhone = sender ? sender.replace(/[^0-9]/g, '') : (env.STORE_OWNER_PHONE || '');
-  const ownerPhone = env.STORE_OWNER_PHONE || senderPhone;
-
-  // 1. Check for interactive WhatsApp list or button reply events
+  // 1b. Check for interactive WhatsApp list or button reply events
   const msgAny = messageContent as Record<string, any>;
   const selectedActionId =
     // List response (singleSelectReply)
@@ -180,45 +250,15 @@ async function processInboundBillingMessage(
       lowerText === 'discard';
 
     if (isPaid || isPending || isCancel) {
-      let { data: latestPending } = await supabase
-        .from('pending_actions')
-        .select('*')
-        .eq('owner_phone', ownerPhone)
-        .eq('status', 'awaiting_confirmation')
-        .order('created_at', { ascending: false })
-        .limit(1)
-        .maybeSingle();
+      const choice = isPaid ? 'paid' : isPending ? 'pending' : 'reject';
 
-      // Fallback matching if ownerPhone has or lacks country code
-      if (!latestPending) {
-        const last10 = ownerPhone.slice(-10);
-        if (last10.length === 10) {
-          const { data: fallbackPending } = await supabase
-            .from('pending_actions')
-            .select('*')
-            .ilike('owner_phone', `%${last10}`)
-            .eq('status', 'awaiting_confirmation')
-            .order('created_at', { ascending: false })
-            .limit(1)
-            .maybeSingle();
-          latestPending = fallbackPending;
-        }
-      }
+      log.info(
+        { messageId, choice, senderPhone },
+        '🔘 Resolving pending bill action via text shorthand'
+      );
 
-      if (latestPending) {
-        const choice = isPaid ? 'paid' : isPending ? 'pending' : 'reject';
-
-        log.info(
-          { messageId, choice, actionId: latestPending.whatsapp_message_id },
-          '🔘 Resolving pending bill action via text shorthand'
-        );
-
-        await handleButtonConfirmation({
-          selectedButtonId: `action_${choice}_${latestPending.whatsapp_message_id}`,
-          senderPhone: ownerPhone,
-        });
-        return;
-      }
+      const resolved = await resolvePendingBillAction(ownerPhone, choice);
+      if (resolved) return;
     }
 
     // Check if the text is a Customer Payment Reminder command (e.g. "remind Ramesh", "send reminder to Suresh")
