@@ -21,39 +21,24 @@ import { handleCustomerReminder } from '../invoicing/reminders.js';
 /**
  * Resolves the most recent pending bill action for an owner given a confirmed choice.
  * Validates that an action is currently awaiting confirmation.
- * If the most recent action was already finalized (completed or cancelled), notifies
- * the owner with a polite alert to prevent duplicate processing or accidental extraction.
+ * If no active action is awaiting confirmation:
+ *   - Checks if the last resolved action was completed within the last 60 seconds:
+ *     if so, returns "⚠️ This bill has already been confirmed and finalized."
+ *   - Otherwise returns "No pending bill awaiting confirmation."
  */
 async function resolvePendingBillAction(
   ownerPhone: string,
   choice: 'paid' | 'pending' | 'reject',
   instance: string
 ): Promise<boolean> {
-  // 1. Look up pending action currently awaiting confirmation
-  let { data: latestPending } = await supabase
+  // 1. Look up the single most recent record in pending_actions that has status = 'awaiting_confirmation'
+  const { data: latestPending } = await supabase
     .from('pending_actions')
     .select('*')
-    .eq('owner_phone', ownerPhone)
     .eq('status', 'awaiting_confirmation')
     .order('created_at', { ascending: false })
     .limit(1)
     .maybeSingle();
-
-  // Fallback matching if ownerPhone has or lacks country code
-  if (!latestPending) {
-    const last10 = ownerPhone.slice(-10);
-    if (last10.length === 10) {
-      const { data: fallbackPending } = await supabase
-        .from('pending_actions')
-        .select('*')
-        .ilike('owner_phone', `%${last10}`)
-        .eq('status', 'awaiting_confirmation')
-        .order('created_at', { ascending: false })
-        .limit(1)
-        .maybeSingle();
-      latestPending = fallbackPending;
-    }
-  }
 
   if (latestPending) {
     await handleButtonConfirmation({
@@ -63,31 +48,23 @@ async function resolvePendingBillAction(
     return true;
   }
 
-  // 2. If no active pending action, check if the latest action was already finalized
-  let { data: latestAny } = await supabase
+  // 2. If no action has status = 'awaiting_confirmation', check the last resolved action
+  const { data: latestResolved } = await supabase
     .from('pending_actions')
     .select('*')
-    .eq('owner_phone', ownerPhone)
+    .in('status', ['completed', 'cancelled'])
     .order('created_at', { ascending: false })
     .limit(1)
     .maybeSingle();
 
-  if (!latestAny) {
-    const last10 = ownerPhone.slice(-10);
-    if (last10.length === 10) {
-      const { data: fallbackAny } = await supabase
-        .from('pending_actions')
-        .select('*')
-        .ilike('owner_phone', `%${last10}`)
-        .order('created_at', { ascending: false })
-        .limit(1)
-        .maybeSingle();
-      latestAny = fallbackAny;
-    }
-  }
+  if (latestResolved) {
+    const billData = (latestResolved.bill_data as Record<string, any>) || {};
+    const resolvedTimestamp = billData.resolved_at
+      ? new Date(billData.resolved_at).getTime()
+      : new Date(latestResolved.created_at).getTime();
+    const elapsedSeconds = (Date.now() - resolvedTimestamp) / 1000;
 
-  if (latestAny) {
-    if (latestAny.status === 'completed' || latestAny.status === 'cancelled') {
+    if (elapsedSeconds <= 60) {
       try {
         await evolution.sendTextMessage(
           instance,
@@ -100,23 +77,20 @@ async function resolvePendingBillAction(
       }
       return true;
     }
-
-    if (latestAny.status === 'superseded') {
-      try {
-        await evolution.sendTextMessage(
-          instance,
-          ownerPhone,
-          '⚠️ This bill draft has been superseded by a newer bill.'
-        );
-      } catch (err: unknown) {
-        const msg = err instanceof Error ? err.message : String(err);
-        console.warn(`[State Engine] Failed to dispatch superseded notice to ${ownerPhone}: ${msg}`);
-      }
-      return true;
-    }
   }
 
-  return false;
+  // 3. If no pending action and not recently finalized, return "No pending bill awaiting confirmation."
+  try {
+    await evolution.sendTextMessage(
+      instance,
+      ownerPhone,
+      'No pending bill awaiting confirmation.'
+    );
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.warn(`[State Engine] Failed to dispatch no-pending notice to ${ownerPhone}: ${msg}`);
+  }
+  return true;
 }
 
 /**
@@ -265,7 +239,7 @@ async function processInboundBillingMessage(
       cleanText === 'settled' ||
       lowerText === 'jama' ||
       cleanText === 'jama' ||
-      lowerText.startsWith('1 ') ||
+      lowerText === '1 paid' ||
       lowerText === 'confirm paid';
 
     const isPending =
@@ -280,7 +254,7 @@ async function processInboundBillingMessage(
       lowerText === 'baaki' ||
       cleanText === 'baki' ||
       cleanText === 'baaki' ||
-      lowerText.startsWith('2 ') ||
+      lowerText === '2 udhaar' ||
       lowerText === 'confirm udhaar';
 
     const isCancel =
@@ -293,7 +267,7 @@ async function processInboundBillingMessage(
       cleanText === 'reject' ||
       lowerText === 'discard' ||
       cleanText === 'discard' ||
-      lowerText.startsWith('3 ') ||
+      lowerText === '3 cancel' ||
       lowerText === 'cancel draft';
 
     if (isPaid || isPending || isCancel) {

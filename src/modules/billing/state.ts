@@ -44,6 +44,7 @@ export interface StoredBillData {
   raw_message_id: string;
   raw_transcription?: string;
   expires_at: string;
+  resolved_at?: string;
 }
 
 export interface CustomerCardInfo {
@@ -64,6 +65,17 @@ export function normalizePhoneNumber(phone?: string): string {
     return `91${clean}`;
   }
   return clean;
+}
+
+/**
+ * Validates if a phone number is a legitimate, deliverable WhatsApp phone number
+ * (not a generated placeholder like walkin- or newcust- and having at least 10 digits).
+ */
+export function isValidDeliverablePhone(phone?: string): boolean {
+  if (!phone) return false;
+  if (phone.startsWith('walkin-') || phone.startsWith('newcust-')) return false;
+  const clean = normalizePhoneNumber(phone);
+  return clean.length >= 10;
 }
 
 /**
@@ -433,7 +445,7 @@ async function generateAndSendInvoice(params: {
     totalAmount,
     items,
     paymentStatus,
-    ownerPhone,
+    ownerPhone: _ownerPhone,
   } = params;
 
   // Zero-amount guardrail: Never generate or dispatch PDF invoices if total_amount <= 0
@@ -465,73 +477,47 @@ async function generateAndSendInvoice(params: {
       pdfBuffer,
     });
 
-    const statusBadge = paymentStatus === 'paid' ? 'PAID' : 'PENDING UDHAAR';
     const cleanBillNo = billNo ? `#${billNo}` : '';
     const pdfBase64 = pdfBuffer.toString('base64');
 
-    // 3. Separate Owner vs Customer Dispatch Determination
-    const cleanCustomerPhone = normalizePhoneNumber(customerPhone);
-    const cleanOwnerPhone = normalizePhoneNumber(ownerPhone || env.STORE_OWNER_PHONE);
+    // 3. Dispatch PDF exclusively to customer if a legitimate, deliverable phone exists
+    const hasDeliverableCustomerPhone = isValidDeliverablePhone(customerPhone);
 
-    const isCustomerPhoneMissingOrWalkin =
-      !cleanCustomerPhone ||
-      cleanCustomerPhone.length < 10 ||
-      customerPhone?.startsWith('walkin-') ||
-      customerPhone?.startsWith('newcust-');
-
-    const isSelfTesting =
-      !isCustomerPhoneMissingOrWalkin &&
-      Boolean(
-        cleanCustomerPhone === cleanOwnerPhone ||
-        (cleanOwnerPhone.length >= 10 && cleanCustomerPhone.endsWith(cleanOwnerPhone.slice(-10))) ||
-        (cleanCustomerPhone.length >= 10 && cleanOwnerPhone.endsWith(cleanCustomerPhone.slice(-10)))
-      );
-
-    const hasSeparateCustomerPhone = !isCustomerPhoneMissingOrWalkin && !isSelfTesting;
-
-    // Helper for reliable WhatsApp media dispatch with base64 and URL fallback
-    const sendPdfDocument = async (targetPhone: string, captionText: string) => {
-      try {
-        await evolution.sendMedia(env.BILLING_INSTANCE_NAME, {
-          number: targetPhone,
-          mediatype: 'document',
-          mimetype: 'application/pdf',
-          media: pdfBase64,
-          fileName: `Invoice_${billNo || 'bill'}.pdf`,
-          caption: captionText,
-        });
-      } catch (sendErr: unknown) {
-        try {
-          await evolution.sendMedia(env.BILLING_INSTANCE_NAME, {
-            number: targetPhone,
-            mediatype: 'document',
-            mimetype: 'application/pdf',
-            media: invoiceUrl,
-            fileName: `Invoice_${billNo || 'bill'}.pdf`,
-            caption: captionText,
-          });
-        } catch (fallbackErr: unknown) {
-          const msg = fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr);
-          console.warn(`[Invoice Dispatch] Failed to send PDF to ${targetPhone}: ${msg}`);
-        }
-      }
-    };
-
-    if (hasSeparateCustomerPhone) {
-      // Dispatch PDF ONLY to Customer with personalized greeting
+    if (hasDeliverableCustomerPhone && customerPhone) {
+      const cleanCustomerPhone = normalizePhoneNumber(customerPhone);
       const customerGreeting =
         paymentStatus === 'paid'
           ? `🧾 *Tax Invoice / Receipt ${cleanBillNo}*\nDear ${customerName}, here is your receipt for Rs. ${totalAmount}. Payment received with thanks!`
           : `🧾 *Invoice ${cleanBillNo}*\nDear ${customerName}, here is your invoice for Rs. ${totalAmount} recorded as Pending Udhaar. Thank you!`;
 
-      await sendPdfDocument(cleanCustomerPhone, customerGreeting);
-    } else {
-      // Self-testing scenario or customer phone missing: Send PDF to Store Owner so generated artifact is visible
-      const targetOwner = cleanOwnerPhone || ownerPhone;
-      if (targetOwner) {
-        const ownerCaption = `🧾 *Invoice ${cleanBillNo} - ${customerName}*\n💰 Total: Rs. ${totalAmount}\n📌 Status: ${statusBadge}`;
-        await sendPdfDocument(targetOwner, ownerCaption);
+      try {
+        await evolution.sendMedia(env.BILLING_INSTANCE_NAME, {
+          number: cleanCustomerPhone,
+          mediatype: 'document',
+          mimetype: 'application/pdf',
+          media: pdfBase64,
+          fileName: `Invoice_${billNo || 'bill'}.pdf`,
+          caption: customerGreeting,
+        });
+      } catch (sendErr: unknown) {
+        try {
+          await evolution.sendMedia(env.BILLING_INSTANCE_NAME, {
+            number: cleanCustomerPhone,
+            mediatype: 'document',
+            mimetype: 'application/pdf',
+            media: invoiceUrl,
+            fileName: `Invoice_${billNo || 'bill'}.pdf`,
+            caption: customerGreeting,
+          });
+        } catch (fallbackErr: unknown) {
+          const msg = fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr);
+          console.warn(`[Invoice Dispatch] Failed to send PDF to customer (${cleanCustomerPhone}): ${msg}`);
+        }
       }
+    } else {
+      console.info(
+        `[Invoice Engine] Bill ${cleanBillNo}: Customer phone (${customerPhone}) is not deliverable via WhatsApp. PDF saved to storage silently: ${invoiceUrl}`
+      );
     }
   } catch (err: unknown) {
     console.error(`[Invoice Hook] PDF generation or dispatch failed for bill ${billId}:`, err);
@@ -611,26 +597,7 @@ export async function handleButtonConfirmation(params: {
     }
   }
 
-  // Determine delivery recipient context
-  const cleanCustomerPhone = normalizePhoneNumber(billData.customer_phone);
-  const cleanOwnerPhone = normalizePhoneNumber(senderPhone || env.STORE_OWNER_PHONE);
-
-  const isCustomerPhoneMissingOrWalkin =
-    !cleanCustomerPhone ||
-    cleanCustomerPhone.length < 10 ||
-    billData.customer_phone?.startsWith('walkin-') ||
-    billData.customer_phone?.startsWith('newcust-');
-
-  const isSelfTesting =
-    !isCustomerPhoneMissingOrWalkin &&
-    Boolean(
-      cleanCustomerPhone === cleanOwnerPhone ||
-      (cleanOwnerPhone.length >= 10 && cleanCustomerPhone.endsWith(cleanOwnerPhone.slice(-10))) ||
-      (cleanCustomerPhone.length >= 10 && cleanOwnerPhone.endsWith(cleanCustomerPhone.slice(-10)))
-    );
-
-  const willDeliverToCustomer = !isCustomerPhoneMissingOrWalkin && !isSelfTesting && totalAmount > 0;
-  const willDeliverToOwner = (isSelfTesting || isCustomerPhoneMissingOrWalkin) && totalAmount > 0;
+  const hasDeliverableCustomerPhone = isValidDeliverablePhone(billData.customer_phone);
 
   // 2. Perform state transitions
   if (actionChoice === 'paid') {
@@ -641,18 +608,26 @@ export async function handleButtonConfirmation(params: {
         .eq('id', billId);
     }
 
+    const updatedBillData: StoredBillData = {
+      ...billData,
+      resolved_at: new Date().toISOString(),
+    };
+
     await supabase
       .from('pending_actions')
-      .update({ status: 'completed' })
+      .update({
+        status: 'completed',
+        bill_data: updatedBillData,
+      })
       .eq('whatsapp_message_id', pendingActionId);
 
     let confirmationText = `✅ Bill ${billNo} for ${customerName} confirmed as PAID (Rs. ${totalAmount}).`;
     if (totalAmount <= 0) {
       confirmationText = `✅ Bill ${billNo} for ${customerName} confirmed as PAID (Rs. ${totalAmount}). (No invoice generated for ₹0 amount).`;
-    } else if (willDeliverToCustomer) {
+    } else if (hasDeliverableCustomerPhone) {
       confirmationText = `✅ Bill ${billNo} for ${customerName} confirmed as PAID (Rs. ${totalAmount}). PDF invoice delivered to customer.`;
-    } else if (willDeliverToOwner) {
-      confirmationText = `✅ Bill ${billNo} for ${customerName} confirmed as PAID (Rs. ${totalAmount}). PDF invoice generated below.`;
+    } else {
+      confirmationText = `✅ Bill ${billNo} for ${customerName} confirmed as PAID (Rs. ${totalAmount}). PDF saved to records.`;
     }
 
     await safeSendTextMessage(senderPhone, confirmationText);
@@ -684,18 +659,26 @@ export async function handleButtonConfirmation(params: {
         .eq('id', billId);
     }
 
+    const updatedBillData: StoredBillData = {
+      ...billData,
+      resolved_at: new Date().toISOString(),
+    };
+
     await supabase
       .from('pending_actions')
-      .update({ status: 'completed' })
+      .update({
+        status: 'completed',
+        bill_data: updatedBillData,
+      })
       .eq('whatsapp_message_id', pendingActionId);
 
     let confirmationText = `⏳ Bill ${billNo} for ${customerName} confirmed as UDHAAR (Rs. ${totalAmount}).`;
     if (totalAmount <= 0) {
       confirmationText = `⏳ Bill ${billNo} for ${customerName} confirmed as UDHAAR (Rs. ${totalAmount}). (No invoice generated for ₹0 amount).`;
-    } else if (willDeliverToCustomer) {
+    } else if (hasDeliverableCustomerPhone) {
       confirmationText = `⏳ Bill ${billNo} for ${customerName} confirmed as UDHAAR (Rs. ${totalAmount}). PDF invoice delivered to customer.`;
-    } else if (willDeliverToOwner) {
-      confirmationText = `⏳ Bill ${billNo} for ${customerName} confirmed as UDHAAR (Rs. ${totalAmount}). PDF invoice generated below.`;
+    } else {
+      confirmationText = `⏳ Bill ${billNo} for ${customerName} confirmed as UDHAAR (Rs. ${totalAmount}). PDF saved to records.`;
     }
 
     await safeSendTextMessage(senderPhone, confirmationText);
@@ -727,9 +710,17 @@ export async function handleButtonConfirmation(params: {
         .eq('id', billId);
     }
 
+    const updatedBillData: StoredBillData = {
+      ...billData,
+      resolved_at: new Date().toISOString(),
+    };
+
     await supabase
       .from('pending_actions')
-      .update({ status: 'cancelled' })
+      .update({
+        status: 'cancelled',
+        bill_data: updatedBillData,
+      })
       .eq('whatsapp_message_id', pendingActionId);
 
     const confirmationText = `❌ *Bill ${billNo} CANCELLED*\nThe draft bill for ${customerName} (₹${totalAmount}) has been cancelled.`;
