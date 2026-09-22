@@ -4,7 +4,7 @@ import { offloadMediaToSupabase } from './bridge.js';
 import { extractBillFromMedia } from './extractor.js';
 import {
   createDraftAndPendingAction,
-  sendConfirmationButtons,
+  sendConfirmationList,
   handleButtonConfirmation,
 } from './state.js';
 import { env } from '../../config/env.js';
@@ -33,25 +33,33 @@ async function processInboundBillingMessage(
   const senderPhone = sender ? sender.replace(/[^0-9]/g, '') : (env.STORE_OWNER_PHONE || '');
   const ownerPhone = env.STORE_OWNER_PHONE || senderPhone;
 
-  // 1. Check for interactive WhatsApp button reply events
+  // 1. Check for interactive WhatsApp list or button reply events
   const msgAny = messageContent as Record<string, any>;
-  const selectedButtonId =
+  const selectedActionId =
+    // List response (singleSelectReply)
+    messageContent.listResponseMessage?.singleSelectReply?.selectedRowId ||
+    messageContent.listResponseMessage?.selectedRowId ||
+    msgAny['list_response']?.singleSelectReply?.selectedRowId ||
+    msgAny['listResponseMessage']?.singleSelectReply?.selectedRowId ||
+    msgAny['interactiveResponseMessage']?.listReply?.id ||
+    msgAny['interactiveResponseMessage']?.singleSelectReply?.selectedRowId ||
+    // Buttons response
     messageContent.buttonsResponseMessage?.selectedButtonId ||
     messageContent.templateButtonReplyMessage?.selectedId ||
     msgAny['buttons_response']?.selectedButtonId ||
     msgAny['interactiveResponseMessage']?.buttonReply?.id;
 
-  if (typeof selectedButtonId === 'string' && selectedButtonId.startsWith('action_')) {
-    log.info({ messageId, selectedButtonId, senderPhone }, '🔘 Received interactive button reply, resolving state...');
+  if (typeof selectedActionId === 'string' && selectedActionId.startsWith('action_')) {
+    log.info({ messageId, selectedActionId, senderPhone }, '🔘 Received interactive list/button selection, resolving state...');
     try {
       const result = await handleButtonConfirmation({
-        selectedButtonId,
+        selectedButtonId: selectedActionId,
         senderPhone: ownerPhone,
       });
-      log.info({ messageId, result }, '✅ Button confirmation resolved successfully');
+      log.info({ messageId, result }, '✅ Action confirmation resolved successfully');
     } catch (err: unknown) {
       const errMsg = err instanceof Error ? err.message : String(err);
-      log.error({ messageId, error: errMsg }, '❌ Failed to resolve button confirmation');
+      log.error({ messageId, error: errMsg }, '❌ Failed to resolve action confirmation');
     }
     return;
   }
@@ -108,16 +116,16 @@ async function processInboundBillingMessage(
           ownerPhone,
         });
 
-        // Stage 3: Send confirmation buttons to store owner
+        // Stage 3: Send confirmation list to store owner
         if (ownerPhone) {
-          log.info({ messageId, ownerPhone, billId: bill.id }, '📤 Sending WhatsApp confirmation buttons to owner...');
-          await sendConfirmationButtons({
+          log.info({ messageId, ownerPhone, billId: bill.id }, '📤 Sending WhatsApp confirmation list to owner...');
+          await sendConfirmationList({
             ownerPhone,
             bill,
             pendingActionId: pendingAction.whatsapp_message_id,
             extractedBill,
           });
-          log.info({ messageId, ownerPhone }, '✅ Confirmation buttons successfully dispatched');
+          log.info({ messageId, ownerPhone }, '✅ Confirmation list successfully dispatched');
         }
       }
     } catch (err: unknown) {
@@ -133,10 +141,38 @@ async function processInboundBillingMessage(
 
     log.info({ messageId, textContent }, '📝 Received text billing message');
 
-    // Check if the text is a shorthand reply to a pending confirmation (e.g. "1", "2", "paid", "udhaar")
+    // Check if the text is a shorthand reply to a pending confirmation (e.g. "1", "2", "3", "paid", "udhaar", "cancel")
     const lowerText = textContent.toLowerCase();
-    if (['1', '2', '3', 'paid', 'udhaar', 'cancel'].includes(lowerText)) {
-      const { data: latestPending } = await supabase
+    const cleanText = lowerText.replace(/[^a-z0-9]/g, '');
+
+    const isPaid =
+      lowerText === '1' ||
+      cleanText === '1' ||
+      cleanText === '1paid' ||
+      lowerText === 'paid' ||
+      lowerText.startsWith('1 ') ||
+      lowerText === 'confirm paid';
+
+    const isPending =
+      lowerText === '2' ||
+      cleanText === '2' ||
+      cleanText === '2udhaar' ||
+      lowerText === 'udhaar' ||
+      lowerText === 'pending' ||
+      lowerText.startsWith('2 ') ||
+      lowerText === 'baki';
+
+    const isCancel =
+      lowerText === '3' ||
+      cleanText === '3' ||
+      cleanText === '3cancel' ||
+      lowerText === 'cancel' ||
+      lowerText.startsWith('3 ') ||
+      lowerText === 'reject' ||
+      lowerText === 'discard';
+
+    if (isPaid || isPending || isCancel) {
+      let { data: latestPending } = await supabase
         .from('pending_actions')
         .select('*')
         .eq('owner_phone', ownerPhone)
@@ -145,13 +181,24 @@ async function processInboundBillingMessage(
         .limit(1)
         .maybeSingle();
 
+      // Fallback matching if ownerPhone has or lacks country code
+      if (!latestPending) {
+        const last10 = ownerPhone.slice(-10);
+        if (last10.length === 10) {
+          const { data: fallbackPending } = await supabase
+            .from('pending_actions')
+            .select('*')
+            .ilike('owner_phone', `%${last10}`)
+            .eq('status', 'awaiting_confirmation')
+            .order('created_at', { ascending: false })
+            .limit(1)
+            .maybeSingle();
+          latestPending = fallbackPending;
+        }
+      }
+
       if (latestPending) {
-        const choice =
-          lowerText === '1' || lowerText === 'paid'
-            ? 'paid'
-            : lowerText === '2' || lowerText === 'udhaar'
-            ? 'pending'
-            : 'reject';
+        const choice = isPaid ? 'paid' : isPending ? 'pending' : 'reject';
 
         log.info(
           { messageId, choice, actionId: latestPending.whatsapp_message_id },
@@ -194,16 +241,16 @@ async function processInboundBillingMessage(
         ownerPhone,
       });
 
-      // Stage 3: Send confirmation buttons to store owner
+      // Stage 3: Send confirmation list to store owner
       if (ownerPhone) {
-        log.info({ messageId, ownerPhone, billId: bill.id }, '📤 Sending WhatsApp confirmation buttons to owner...');
-        await sendConfirmationButtons({
+        log.info({ messageId, ownerPhone, billId: bill.id }, '📤 Sending WhatsApp confirmation list to owner...');
+        await sendConfirmationList({
           ownerPhone,
           bill,
           pendingActionId: pendingAction.whatsapp_message_id,
           extractedBill,
         });
-        log.info({ messageId, ownerPhone }, '✅ Confirmation buttons successfully dispatched');
+        log.info({ messageId, ownerPhone }, '✅ Confirmation list successfully dispatched');
       }
     } catch (err: unknown) {
       const errMsg = err instanceof Error ? err.message : String(err);

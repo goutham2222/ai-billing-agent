@@ -22,6 +22,17 @@ export interface EvolutionButtonReply {
   selectedDisplayText?: string;
 }
 
+export interface EvolutionListReply {
+  singleSelectReply?: {
+    selectedRowId?: string;
+    title?: string;
+    description?: string;
+  };
+  selectedRowId?: string;
+  title?: string;
+  description?: string;
+}
+
 export interface EvolutionMessageContent {
   conversation?: string;
   extendedTextMessage?: {
@@ -32,6 +43,12 @@ export interface EvolutionMessageContent {
   documentMessage?: EvolutionMediaMessage & { fileName?: string };
   buttonsResponseMessage?: EvolutionButtonReply;
   templateButtonReplyMessage?: EvolutionButtonReply;
+  listResponseMessage?: EvolutionListReply;
+  interactiveResponseMessage?: {
+    buttonReply?: { id?: string; title?: string };
+    listReply?: { id?: string; title?: string; description?: string };
+    singleSelectReply?: { selectedRowId?: string };
+  };
   [key: string]: unknown;
 }
 

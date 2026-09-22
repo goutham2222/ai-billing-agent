@@ -186,16 +186,17 @@ export async function createDraftAndPendingAction(params: {
 }
 
 /**
- * Formats a WhatsApp summary card and dispatches interactive confirmation buttons
- * to the store owner via Evolution API.
+ * Formats a WhatsApp summary card and dispatches interactive list message
+ * to the store owner via Evolution API, with automatic structured text fallback.
  */
-export async function sendConfirmationButtons(params: {
+export async function sendConfirmationList(params: {
   ownerPhone: string;
   bill: { id: string; bill_no?: number; total_amount: number };
   pendingActionId: string;
   extractedBill: ExtractedBill;
 }): Promise<unknown> {
   const { ownerPhone, bill, pendingActionId, extractedBill } = params;
+  const customerName = extractedBill.customer.name?.trim() || 'Customer';
 
   // Build items formatted list
   const itemsText = extractedBill.items.length > 0
@@ -220,50 +221,65 @@ export async function sendConfirmationButtons(params: {
 
   const billNumberText = bill.bill_no ? ` #${bill.bill_no}` : '';
 
-  const title = `🧾 *Bill Confirmation${billNumberText}*`;
+  // 1. Title: "📝 Confirm Bill for {customerName}"
+  const title = `📝 Confirm Bill for ${customerName}${billNumberText}`;
+
+  // 2. Description: Formatted summary (items list, total amount, detected status)
   const description = [
-    `👤 *Customer:* ${extractedBill.customer.name}`,
     `🛒 *Items:*`,
     itemsText,
     amountWarning,
     `💰 *Total Amount:* ₹${extractedBill.totalAmount}`,
     `📌 *Detected Status:* ${statusLabel}`,
-    ``,
-    `Please tap a button below to confirm:`,
   ]
     .filter((line) => line !== '')
     .join('\n');
 
-  const buttons = [
+  // 3. Section rows
+  const sections = [
     {
-      id: `action_paid_${pendingActionId}`,
-      text: '✅ Confirm Paid',
-    },
-    {
-      id: `action_pending_${pendingActionId}`,
-      text: '⏳ Confirm Udhaar',
-    },
-    {
-      id: `action_reject_${pendingActionId}`,
-      text: '❌ Reject / Cancel',
+      title: 'Select Action',
+      rows: [
+        {
+          rowId: `action_paid_${pendingActionId}`,
+          title: '✅ Confirm Paid',
+          description: 'Mark bill as settled',
+        },
+        {
+          rowId: `action_pending_${pendingActionId}`,
+          title: '⏳ Confirm Udhaar',
+          description: 'Add to customer debt ledger',
+        },
+        {
+          rowId: `action_reject_${pendingActionId}`,
+          title: '❌ Cancel / Reject',
+          description: 'Discard this draft',
+        },
+      ],
     },
   ];
 
   try {
-    return await evolution.sendButtons(
+    return await evolution.sendList(
       env.BILLING_INSTANCE_NAME,
       ownerPhone,
       title,
       description,
-      buttons,
+      'Select Action',
+      sections,
       'AI Billing Agent'
     );
-  } catch (buttonError: unknown) {
-    // Fallback to text message if interactive buttons are rejected by recipient client
-    const fallbackText = `${title}\n\n${description}\n\nReply with:\n1️⃣ for Paid\n2️⃣ for Udhaar\n3️⃣ for Cancel`;
+  } catch (listError: unknown) {
+    const errorMsg = listError instanceof Error ? listError.message : String(listError);
+    console.warn(`[Evolution List] sendList failed (${errorMsg}), falling back to text`);
+    // Enhanced text fallback with explicit reply instructions
+    const fallbackText = `${title}\n\n${description}\n\nReply with 1 (Paid), 2 (Udhaar), or 3 (Cancel)`;
     return await safeSendTextMessage(ownerPhone, fallbackText);
   }
 }
+
+// Retain alias for backward compatibility
+export const sendConfirmationButtons = sendConfirmationList;
 
 /**
  * Resolves an owner's button click reply and updates the pending action
@@ -373,3 +389,4 @@ export async function handleButtonConfirmation(params: {
 
   return { success: false, message: 'Unrecognized action choice' };
 }
+

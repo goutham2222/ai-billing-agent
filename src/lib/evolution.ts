@@ -11,6 +11,17 @@ export interface ButtonOption {
   text: string;
 }
 
+export interface ListRowOption {
+  title: string;
+  description?: string;
+  rowId: string;
+}
+
+export interface ListSection {
+  title: string;
+  rows: ListRowOption[];
+}
+
 export class EvolutionClient {
   private http: AxiosInstance;
 
@@ -123,6 +134,39 @@ export class EvolutionClient {
     } catch (error: unknown) {
       const msg = error instanceof Error ? error.message : String(error);
       throw new Error(`Failed to send WhatsApp text via Evolution API (${instance}): ${msg}`);
+    }
+  }
+
+  /**
+   * Sends interactive list message to a WhatsApp recipient.
+   * Evolution API v2 endpoint: POST /message/sendList/{instance}
+   */
+  async sendList(
+    instance: string,
+    to: string,
+    title: string,
+    description: string,
+    buttonText: string,
+    sections: ListSection[],
+    footerText?: string
+  ): Promise<unknown> {
+    const formattedNumber = to.replace(/[^0-9]/g, '');
+    try {
+      return await this.postWithFallback(
+        (inst) => `/message/sendList/${inst}`,
+        instance,
+        {
+          number: formattedNumber,
+          title,
+          description,
+          buttonText,
+          footerText: footerText || 'AI Billing Agent',
+          sections,
+        }
+      );
+    } catch (error: unknown) {
+      const msg = error instanceof Error ? error.message : String(error);
+      throw new Error(`Failed to send WhatsApp list via Evolution API (${instance}): ${msg}`);
     }
   }
 
