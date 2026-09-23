@@ -10,14 +10,15 @@ A self-hosted, multimodal WhatsApp billing platform that turns unstructured Kira
 
 ---
 
-## 🏗️ System Architecture
+## Architecture
 
-The agent is engineered around an event-driven, decoupled micro-architecture tailored for the constraints of conversational retail:
+### Overview
+The agent is built on an event-driven, decoupled micro-architecture designed specifically for conversational retail environments:
 
-- **Event-Driven Webhook Ingestion**: Receives inbound WhatsApp events from an Evolution API v2 gateway via Fastify HTTP endpoints, instantly acknowledging with `200 OK` in <10ms to eliminate Baileys retry loops.
-- **Single-Chat Unified Intent Routing**: Processes all interactions inside a single store owner WhatsApp conversation, differentiating between bill drafts, numeric confirmation shorthand (`1`, `2`, `3`), payment reminders, and Text-to-SQL analytics queries via regex and linguistic heuristics without state collisions.
-- **Asynchronous Background Offload**: Multimodal Gemini 1.5 Flash extractions, PDFKit invoice compilation, and customer WhatsApp dispatches execute asynchronously in background workers, ensuring immediate interactive feedback to the store owner.
-- **Dual-Storage Persistence**: Decouples unstructured media storage from relational transactional data using Supabase Storage buckets (`bills` for raw voice/images, `invoices` for generated PDF receipts) alongside a PostgreSQL database with strict foreign keys and atomic state transitions.
+- **Event-Driven Webhook Ingestion**: Receives inbound WhatsApp events from an Evolution API v2 gateway via Fastify HTTP endpoints, acknowledging immediately with `200 OK` in <10ms to eliminate Baileys retry loops.
+- **Single-Chat Unified Intent Routing**: Operates within a single store owner WhatsApp chat, using regex and linguistic heuristics to route between bill drafting, numeric confirmation shorthand (`1`, `2`, `3`), payment reminders, and Text-to-SQL analytics without conversational collisions.
+- **Asynchronous Background Offload**: Offloads Gemini 1.5 Flash multimodal parsing, PDFKit invoice generation, and customer WhatsApp messaging to asynchronous background tasks for real-time responsiveness.
+- **Dual-Storage Persistence**: Combines Supabase Storage buckets (`bills` for incoming voice/image binaries and `invoices` for generated PDF receipts) with a PostgreSQL relational database for strict transactional consistency and atomic state transitions.
 
 ```mermaid
 flowchart TD
@@ -67,18 +68,66 @@ flowchart TD
 
 ---
 
-## ⚡ Quickstart & Testing Guide
+## Key Features
+
+### 1. Multimodal Ingestion
+- **Voice Note Billing**: Accepts WhatsApp audio messages (`.ogg` / `.opus`), stores raw audio in Supabase Storage, and natively transcribes item quantities, prices, and customer details using Gemini 1.5 Flash.
+- **Paper Receipt OCR**: Parses images of handwritten register chits or printed thermal receipts with zero manual data entry.
+- **Text Stream**: Ingests shorthand conversational messages like `"Ramesh 9876543210 2 sugar 90, 1 oil 160 paid"`.
+
+### 2. Vernacular Debt Semantics
+- Automatically detects settlement versus credit status across English, Hindi, and Telugu:
+  - **Settled / Cash**: `paid`, `cash`, `gpay`, `phonepe`, `received`, `settled`, `jama`, `diya`, `ichadu`.
+  - **Credit / Udhaar**: `udhaar`, `baki`, `baaki`, `credit`, `pending`, `katha`, `khata`, `ivvali`, `lena hai`.
+
+### 3. 3-Tier Customer CRM
+- **Tier 1: Existing Customer**: Matched by phone number or name (`ILIKE`). The confirmation card dynamically surfaces their outstanding balance:
+  ```text
+  Customer: Ramesh (Existing — Outstanding Udhaar: Rs. 1,450)
+  ```
+- **Tier 2: New Customer Onboarded**: Registered automatically when a name or phone is seen for the first time, starting with `0` initial debt.
+- **Tier 3: Walk-in Customer (Anonymous)**: Assigned when no identifiers are present.
+- **Walk-in Credit Prevention**: Anonymous walk-in bills cannot be confirmed as Udhaar (`2`). The system alerts the store owner and holds the draft until customer identification is provided.
+
+### 4. Atomic State Engine
+- **Single Active Draft**: Exactly one draft is active per store owner at any time. Ingesting a new bill automatically marks any pending unconfirmed draft as `superseded`.
+- **Deterministic Shorthand**: Review drafts are confirmed using numeric shorthand:
+  - `1` (or `paid`, `settled`) ➔ Confirm Paid
+  - `2` (or `udhaar`, `pending`) ➔ Confirm Udhaar
+  - `3` (or `cancel`, `discard`) ➔ Discard Draft
+- **60-Second Finalization Window**: If an owner replies shorthand after confirmation, the system checks `resolved_at`. If resolved within 60 seconds, it alerts:
+  ```text
+  ⚠️ This bill has already been confirmed and finalized.
+  ```
+- **Quantity-Prefix Preservation**: Eliminates numeric prefix ambiguity so messages like `"2 cold drinks 80"` extract as line items rather than triggering shorthand confirmation `2`.
+
+### 5. Invoicing & Reminders
+- **Branded PDF Generation**: Uses PDFKit to produce clean tax invoices with store branding, itemized tables, totals, and colored status badges (`PAID` in green, `PENDING UDHAAR` in amber).
+- **Zero Owner Document Spam**: The store owner receives only a text confirmation card; PDF documents are not spammed to the owner's chat.
+- **Direct Customer Delivery**: Delivered directly to the customer's WhatsApp if a valid 10+ digit phone exists. For placeholder numbers (`newcust-`, `walkin-`), the PDF URL is silently stored in `bills.pdf_url`.
+- **Vernacular Payment Reminders**: The owner can trigger payment reminders via `"remind <name>"` to query outstanding balances and dispatch polite reminders in the customer's preferred language.
+
+### 6. Text-to-SQL Analytics
+- **Conversational Business Intelligence**: Store owners can ask natural language business questions directly in WhatsApp (e.g., `"? Who owes more than 500 rupees?"`, `"Total sales today?"`, `"Aaj ka hisaab?"`).
+- **Strict Read-Only Guardrails**:
+  - Enforces `SELECT`-only execution; all mutating statements (`INSERT`, `UPDATE`, `DELETE`, `DROP`, `ALTER`, `TRUNCATE`) and multi-statement semicolons (`;`) are blocked.
+  - Access to PostgreSQL system tables (`pg_*`, `information_schema`) is restricted.
+  - Executed on a dedicated PostgreSQL read-only transaction with a strict 3000ms timeout and a 50-row output clamp.
+
+---
+
+## Quickstart & Testing Guide
 
 ### Prerequisites
 - **Node.js**: v20.x or higher
 - **Docker & Docker Compose**: For running Evolution API v2 gateway
-- **Supabase Project**: With PostgreSQL database and Storage buckets (`bills`, `invoices`)
-- **Google Gemini API Key**: For multimodal extraction and Text-to-SQL analytics
+- **Supabase Project**: PostgreSQL database and Storage buckets (`bills`, `invoices`)
+- **Google Gemini API Key**: For multimodal bill extraction and SQL translation
 - **Active WhatsApp Number**: Connected to the Evolution API instance
 
 ---
 
-### Local Installation & Startup
+### Local Setup
 
 1. **Clone the repository:**
    ```bash
@@ -86,105 +135,62 @@ flowchart TD
    cd ai-billing-agent
    ```
 
-2. **Install project dependencies:**
+2. **Install dependencies:**
    ```bash
    npm install
    ```
 
 3. **Configure Environment Variables:**
-   Copy `.env.example` to `.env` and fill in your keys:
+   Copy `.env.example` to `.env` and fill in the required keys:
    ```bash
    cp .env.example .env
    ```
-   Required keys:
+   Key environment variables:
    - `GEMINI_API_KEY`: Google Gemini API key
-   - `SUPABASE_URL` & `SUPABASE_SERVICE_ROLE_KEY`: Supabase project credentials
-   - `DATABASE_URL`: PostgreSQL connection string (with encoded password)
-   - `EVOLUTION_API_URL` & `EVOLUTION_API_KEY`: Evolution API endpoint and auth token
-   - `EVOLUTION_INSTANCE_NAME`: Name of your configured WhatsApp instance
+   - `SUPABASE_URL` & `SUPABASE_SERVICE_ROLE_KEY`: Supabase credentials
+   - `DATABASE_URL`: PostgreSQL connection string
+   - `EVOLUTION_API_URL` & `EVOLUTION_API_KEY`: Evolution API URL and API key
+   - `EVOLUTION_INSTANCE_NAME`: Name of your WhatsApp instance
    - `STORE_OWNER_PHONE`: Normalized E.164 phone number of store owner (e.g. `919550145675`)
 
-4. **Launch WhatsApp Gateway (Docker):**
+4. **Launch Evolution API (Docker):**
    ```bash
    docker compose -f infra/docker-compose.yml up -d
    ```
-   Open `http://localhost:8080`, pair your WhatsApp instance via QR code, and point the webhook to `https://your-public-url/webhook/billing`.
+   Open `http://localhost:8080`, scan the QR code to connect WhatsApp, and configure the webhook to `https://your-domain/webhook/billing`.
 
-5. **Start Application in Development Mode:**
+5. **Start Development Server:**
    ```bash
    npm run dev
    ```
 
 ---
 
-### 🧪 Test Drive Cheat Sheet
+### Test Drive Cheat Sheet
 
-Use these exact WhatsApp messages from the authorized `STORE_OWNER_PHONE` to test the agent end-to-end:
+Send these messages from your authorized `STORE_OWNER_PHONE` to test the full lifecycle:
 
-| Workflow | Example Message / Action | Expected Result |
+| Action / Test Case | WhatsApp Message | Expected Behavior |
 | :--- | :--- | :--- |
-| **New Customer Bill** | `Ramesh 9876543210 2 kg sugar 90, 1 sunflower oil 160 paid` | Draft created, registers Ramesh as new customer, sends confirmation card with total Rs. 250. |
-| **Vernacular Udhaar Bill** | `Suresh 9123456789 5 packets bread 200 udhaar` | Detects `udhaar` debt marker, creates draft awaiting confirmation with total Rs. 200. |
-| **Confirm as Paid** | Reply `1` or `paid` | Confirms bill as PAID, updates customer ledger, delivers PDF invoice to customer WhatsApp, sends text receipt summary to owner. |
-| **Confirm as Udhaar** | Reply `2` or `udhaar` | Confirms bill as PENDING UDHAAR, updates outstanding debt balance on customer record, delivers PDF invoice. |
-| **Discard / Cancel** | Reply `3` or `cancel` | Cancels the active draft, notifies owner that draft has been discarded. |
-| **Walk-in Udhaar Guardrail** | Ingest: `2 cold drinks 80`<br>Then reply `2` | System blocks Udhaar credit: *"⚠️ Cannot assign Udhaar to an anonymous Walk-in Customer. Please provide customer name or phone."* Draft remains active. |
-| **Manager Analytics (English)**| `? Who owes more than 500 rupees?` | Text-to-SQL engine queries PostgreSQL customer ledger and returns formatted debt breakdown. |
-| **Manager Analytics (Vernacular)**| `Aaj ka total sales kitna hai?` | Generates safe `SELECT SUM(total_amount)` query and reports today's total revenue in WhatsApp. |
-| **Customer Payment Reminder**| `remind Suresh` | Fetches Suresh's pending bills and total debt, and sends a polite payment reminder to his WhatsApp. |
-| **Reset Test Environment** | Run in terminal: `npm run db:clean` | Truncates `pending_actions`, `bills`, `customers`, restarts bill sequence to 1, and empties storage buckets. |
+| **New Customer Bill** | `Ramesh 9876543210 2 kg sugar 90, 1 sunflower oil 160 paid` | Draft created, Ramesh registered as new customer, confirmation card dispatched (Total: Rs. 250). |
+| **Vernacular Udhaar Bill** | `Suresh 9123456789 5 bread 200 udhaar` | Extracts items and flags `udhaar` credit status, creating a review draft for Rs. 200. |
+| **Confirm Paid** | `1` or `paid` | Confirms draft as PAID, updates customer ledger, delivers PDF to customer WhatsApp, sends text receipt to owner. |
+| **Confirm Udhaar** | `2` or `udhaar` | Confirms draft as PENDING UDHAAR, updates outstanding debt balance on customer record, delivers PDF. |
+| **Discard Draft** | `3` or `cancel` | Cancels the active draft and confirms cancellation to the owner. |
+| **Walk-in Credit Guardrail** | Send: `2 cold drinks 80`<br>Then reply: `2` | Udhaar blocked: *"⚠️ Cannot assign Udhaar to an anonymous Walk-in Customer. Please provide customer name or phone."* Draft remains active. |
+| **Manager Analytics (English)** | `? Who owes more than 500 rupees?` | Translates to `SELECT`, queries ledger, and returns customer debt breakdown. |
+| **Manager Analytics (Vernacular)**| `Aaj ka total sales kitna hai?` | Translates to `SELECT SUM(total_amount)`, returns today's sales figure. |
+| **Customer Payment Reminder** | `remind Suresh` | Queries Suresh's pending debt and sends a polite reminder directly to his WhatsApp. |
+| **Clean Database Utility** | Terminal: `npm run db:clean` | Truncates `pending_actions`, `bills`, `customers`, resets bill sequence to 1, and clears storage buckets. |
 
 ---
 
-## 🎯 Core Capabilities & Feature Deep Dives
+## Database Schema
 
-### 1. Multimodal Ingestion & Vernacular Extraction
-- **Voice Note Billing**: Kirana owners can dictate bills via WhatsApp audio notes (`.ogg`/`.opus`). The audio is uploaded to Supabase Storage and parsed natively by Gemini 1.5 Flash.
-- **Paper Receipt OCR**: Takes photos of handwritten receipts or register books and extracts customer names, phone numbers, items, units, unit prices, and totals.
-- **Multilingual Vernacular Debt Detection**: Automatically parses payment intent across English, Hindi, and Telugu:
-  - **Settled / Cash**: `paid`, `cash`, `gpay`, `phonepe`, `received`, `settled`, `jama`.
-  - **Credit / Debt**: `udhaar`, `baki`, `baaki`, `credit`, `pending`, `katha`, `khata`, `ivvali`, `raavali`.
-
-### 2. 3-Tier Customer Ledger CRM
-- **Tier 1: Existing Customer**: Matched by phone number (last 10 digits) or name (`ILIKE`). The confirmation card dynamically surfaces their historical unpaid balance:
-  ```text
-  Customer: Ramesh (Existing — Outstanding Udhaar: Rs. 1,450)
-  ```
-- **Tier 2: New Customer Onboarded**: Created when customer details (name or phone) are provided for the first time. Inserted with initial debt balance of `0`.
-- **Tier 3: Walk-in Customer (Anonymous)**: Assigned strictly when zero customer identifiers are provided.
-- **Walk-in Credit Prevention**: Anonymous walk-in bills cannot be confirmed as Udhaar (`2`). The system alerts the store owner and preserves the draft until a name or phone is supplied.
-
-### 3. Atomic State Machine & Single-Action Guardrails
-- **Single Active Pending Action**: Only one draft is active per store owner at any given time. If a new bill is ingested before the previous draft is confirmed, the previous draft is marked `superseded`.
-- **60-Second Finalization Window**: If an owner replies `1`, `2`, or `3` after a bill has already been confirmed, the system verifies `resolved_at`. If finalized within the last 60 seconds, it alerts:
-  ```text
-  ⚠️ This bill has already been confirmed and finalized.
-  ```
-- **Quantity-Prefix Preservation**: Eliminates prefix ambiguities so messages like `"2 cold drinks 80"` extract as bills first rather than being misparsed as shorthand choice `2`.
-
-### 4. Dynamic PDF Invoicing & Automated Reminders
-- **Branded PDF Invoices**: Generates clean, formatted receipts using PDFKit featuring Store Name, Date, Bill Number, Itemized Line Table, Total, and visual badges (`PAID / SETTLED` in green, `PENDING UDHAAR` in amber).
-- **Zero Owner Document Spam**: When a bill is confirmed, the store owner receives **only** a clean text confirmation message.
-- **Customer Delivery**: If the customer has a valid phone number, the PDF document is sent directly to the customer's WhatsApp with a personalized greeting. For placeholder numbers (`newcust-`, `walkin-`), the PDF URL is stored in Supabase Storage silently (`PDF saved to records.`).
-- **Customer Payment Reminders**: The owner can type `"remind Raghu"` or `"send reminder to Suresh"` to query their unsettled ledger balance and dispatch a polite reminder message in their preferred language.
-
-### 5. Text-to-SQL Manager Analytics Engine
-- **Natural Language Business Intelligence**: Store owners can query sales, inventory, and customer debts using everyday conversational language (e.g. `"? Who owes more than 500 rupees?"`, `"Total sales today?"`, `"Aaj ka hisaab?"`).
-- **Strict Read-Only Guardrails**:
-  - Only `SELECT` statements are allowed.
-  - Queries containing `INSERT`, `UPDATE`, `DELETE`, `DROP`, `ALTER`, `TRUNCATE`, `GRANT`, `REVOKE`, or multi-statement semicolons (`;`) are strictly blocked.
-  - Access to PostgreSQL system tables (`pg_*`, `information_schema`) is blocked.
-  - Session-level `SET TRANSACTION READ ONLY` with strict 3000ms statement timeout.
-  - Output is clamped to 50 rows maximum to prevent token overflows.
-
----
-
-## 🗄️ Database Schema
-
-### PostgreSQL Schema Architecture (`Supabase`)
+Summary of primary Supabase PostgreSQL tables:
 
 ```sql
--- 1. Customers Table
+-- 1. Customers Table (Patron Ledger)
 CREATE TABLE customers (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     name TEXT NOT NULL,
@@ -193,10 +199,10 @@ CREATE TABLE customers (
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
--- 2. Bills Table
+-- 2. Bills Table (Transaction History)
 CREATE TABLE bills (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    bill_no SERIAL, -- Auto-incrementing integer bill identifier (e.g. 1, 2, 3...)
+    bill_no SERIAL, -- Auto-incrementing human-readable bill number
     customer_id UUID REFERENCES customers(id) ON DELETE SET NULL,
     total_amount NUMERIC(12, 2) NOT NULL,
     items JSONB DEFAULT '[]', -- [{"name": "Sugar", "quantity": 2, "unit": "kg", "unitPrice": 45, "totalPrice": 90}]
@@ -206,10 +212,10 @@ CREATE TABLE bills (
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
--- 3. Pending Actions Table (Human-in-the-Loop State Machine)
+-- 3. Pending Actions Table (State Machine)
 CREATE TABLE pending_actions (
     whatsapp_message_id TEXT PRIMARY KEY,
-    bill_data JSONB, -- Draft bill payload snapshot including customer tier & debt
+    bill_data JSONB, -- Draft payload snapshot (items, customer tier, debt)
     owner_phone TEXT,
     status TEXT DEFAULT 'awaiting_confirmation', -- 'awaiting_confirmation', 'completed', 'cancelled', 'superseded'
     created_at TIMESTAMPTZ DEFAULT NOW()
@@ -218,67 +224,36 @@ CREATE TABLE pending_actions (
 
 ---
 
-## 📂 Project Structure
+## Project Structure
 
 ```text
-ai-billing-agent/
-├── docs/                   # System documentation & PRD
-│   ├── ARCHITECTURE.md     # Architecture specifications
-│   ├── MIGRATION_READONLY.sql # PostgreSQL read-only user creation script
-│   ├── PRD.md              # Product requirements document
-│   └── SCHEMA.md           # Database schema documentation
-├── infra/                  # Docker infrastructure for WhatsApp gateway
-│   └── docker-compose.yml  # Evolution API v2, PostgreSQL, & Redis
-├── scripts/                # Database maintenance & testing scripts
-│   └── clean-slate.ts      # Supabase tables & storage reset utility (npm run db:clean)
-├── src/
-│   ├── config/             # Zod environment schema validation
-│   │   └── env.ts
-│   ├── lib/                # Core clients & connection pools
-│   │   ├── db-readonly.ts  # Read-only PG pool with timeout & connection URI encoding
-│   │   ├── evolution.ts    # Evolution API v2 WhatsApp client (text, media, polls)
-│   │   ├── gemini.ts       # Gemini SDK client with exponential backoff & model fallbacks
-│   │   └── supabase.ts     # Supabase admin client (Service Role)
-│   ├── modules/
-│   │   ├── billing/        # Ingestion, Gemini extraction, state engine, & routing
-│   │   │   ├── bridge.ts   # Binary media offloader to Supabase Storage
-│   │   │   ├── extractor.ts# Multimodal bill parser (text, audio, image)
-│   │   │   ├── routes.ts   # Webhook listener, intent classifier, & shorthand router
-│   │   │   ├── schemas.ts  # Zod validation schemas for line items & customer info
-│   │   │   └── state.ts    # Draft persistence, confirmation logic, & 3-tier CRM
-│   │   ├── invoicing/      # PDF receipt generation & customer debt reminders
-│   │   │   ├── pdf-generator.ts # Branded PDFKit receipt builder
-│   │   │   ├── reminders.ts     # Vernacular payment reminder dispatch
-│   │   │   └── storage.ts       # Supabase Storage invoice bucket manager
-│   │   ├── manager/        # Manager Text-to-SQL analytics engine
-│   │   │   ├── executor.ts # AST/regex SQL guardrails & query execution
-│   │   │   ├── routes.ts   # Manager endpoint & authorization
-│   │   │   ├── schema-context.ts # Postgres DDL & business intelligence context
-│   │   │   └── sql-generator.ts  # Text-to-SQL translation with Gemini
-│   │   └── routing/        # Intent classification for single-account dual bots
-│   │       └── classifier.ts# Linguistic regex & prefix detection
-│   ├── types/
-│   │   └── evolution.ts    # Evolution API webhook payload type definitions
-│   └── index.ts            # Fastify application bootstrap & server listener
-├── DEBUG_LOG.md            # Production incident log & root cause resolutions
-├── package.json
-└── tsconfig.json
+src/
+├── config/
+│   └── env.ts                     # Zod environment variable schema & validation
+├── lib/
+│   ├── db-readonly.ts             # Read-only PostgreSQL pool with safety timeouts
+│   ├── evolution.ts               # Evolution API v2 WhatsApp client (text, media, polls)
+│   ├── gemini.ts                  # Gemini 1.5 Flash client with fallbacks & backoff
+│   └── supabase.ts                # Supabase admin client (Service Role)
+├── modules/
+│   ├── billing/                   # Multimodal ingestion, extraction & confirmation
+│   │   ├── bridge.ts              # Media binary offloader to Supabase Storage
+│   │   ├── extractor.ts           # Multimodal Gemini bill parser (text, audio, image)
+│   │   ├── routes.ts              # Webhook receiver & confirmation shorthand handler
+│   │   ├── schemas.ts             # Zod validation schemas for bill line items & customer data
+│   │   └── state.ts               # Atomic draft state machine & 3-tier customer CRM
+│   ├── invoicing/                 # Receipts & customer payment reminders
+│   │   ├── pdf-generator.ts       # Branded PDFKit tax receipt generator
+│   │   ├── reminders.ts           # Vernacular customer payment reminder engine
+│   │   └── storage.ts             # Supabase Storage invoice bucket manager
+│   ├── manager/                   # Natural language business analytics
+│   │   ├── executor.ts            # Read-only SQL executor with AST/regex guardrails
+│   │   ├── routes.ts              # Manager query router & authorization
+│   │   ├── schema-context.ts      # PostgreSQL schema context for Gemini prompt
+│   │   └── sql-generator.ts       # Text-to-SQL translation via Gemini 1.5 Flash
+│   └── routing/                   # Unified message classification
+│       └── classifier.ts          # Regex & linguistic intent classifier (Billing vs Manager)
+├── types/
+│   └── evolution.ts               # Evolution API webhook payload type definitions
+└── index.ts                       # Fastify application bootstrap & server lifecycle
 ```
-
----
-
-## 🏆 Milestone Completion Status
-
-| Stage | Milestone Description | Status |
-| :---: | :--- | :---: |
-| **Stage 1** | **Foundation & Inbound Webhook Pipeline**<br>Fastify server setup, Evolution API v2 webhook receiver, Supabase Storage binary offloading bridge. | ✅ **Complete** |
-| **Stage 2** | **Multimodal Gemini Extraction Engine**<br>Multimodal parsing with Gemini 1.5 Flash (`@google/genai`) for text, voice notes (`.ogg`/`.opus`), and receipt images with Zod validation and multilingual vernacular debt detection (`baki`, `udhaar`, `ivvali`). | ✅ **Complete** |
-| **Stage 3** | **State Engine & Atomic Confirmation Workflows**<br>Single active draft enforcement (`superseded`), deterministic text shorthand (`1`=Paid, `2`=Udhaar, `3`=Cancel), 3-tier customer CRM (Existing with debt, New Onboarded, Walk-in Anonymous), and Walk-in Udhaar guardrail. | ✅ **Complete** |
-| **Stage 4** | **Manager Bot Text-to-SQL Engine**<br>Natural language queries translated to SQL via Gemini, executed over read-only PostgreSQL role, AST/regex guardrails enforcing strict `SELECT` only, zero destructive commands, and execution row/timeout clamps. | ✅ **Complete** |
-| **Stage 5** | **Dynamic PDF Invoicing & WhatsApp Reminders**<br>Branded PDF generation using PDFKit, Supabase Storage `invoices` bucket integration, customer WhatsApp delivery with store owner text confirmation, and automated vernacular debt payment reminders. | ✅ **Complete** |
-
----
-
-## 📜 License
-
-MIT License. Built for modern Kirana and retail store digitization.
